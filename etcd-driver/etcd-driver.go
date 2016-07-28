@@ -20,9 +20,11 @@ import (
 	"github.com/golang/glog"
 	"github.com/tigera/libcalico-go/datastructures/ip"
 	"github.com/tigera/libcalico-go/datastructures/set"
-	"github.com/tigera/libcalico-go/etcd-driver/etcd"
 	"github.com/tigera/libcalico-go/etcd-driver/ipsets"
 	"github.com/tigera/libcalico-go/etcd-driver/store"
+	"github.com/tigera/libcalico-go/lib/api"
+	"github.com/tigera/libcalico-go/lib/backend"
+	"github.com/tigera/libcalico-go/lib/backend/etcd"
 	"gopkg.in/vmihailenco/msgpack.v2"
 	"net"
 	"os"
@@ -72,11 +74,6 @@ func main() {
 	}
 	ipsetResolver := ipsets.NewResolver(felixConn, hostname)
 	ipsetResolver.RegisterWith(dispatcher)
-
-	// Get an etcd driver
-	datastore, err := etcd.New(felixConn, &store.DriverConfiguration{})
-	felixConn.datastore = datastore
-
 	// TODO callback functions or callback interface?
 	ipsetResolver.OnIPSetAdded = felixConn.onIPSetAdded
 	ipsetResolver.OnIPSetRemoved = felixConn.onIPSetRemoved
@@ -86,6 +83,22 @@ func main() {
 	glog.Info("Starting the datastore driver")
 	felixConn.Start()
 	felixConn.Join()
+}
+
+func (cbs *FelixConnection) handleInitFromFelix(msg map[interface{}]interface{}) {
+
+	// Get an etcd driver
+	cfg := api.ClientConfig{
+		BackendType:   api.EtcdV2,
+		BackendConfig: &etcd.EtcdConfig{},
+	}
+	datastore, err := backend.NewClient(cfg)
+	if err != nil {
+		panic(err)
+	}
+	cbs.syncer = datastore.Syncer(cbs.dispatcher)
+
+	cbs.syncer.Start()
 }
 
 type ipUpdate struct {
@@ -99,7 +112,7 @@ type FelixConnection struct {
 	encoder    *msgpack.Encoder
 	decoder    *msgpack.Decoder
 	dispatcher *store.Dispatcher
-	datastore  Startable
+	syncer     Startable
 	addedIPs   set.Set
 	removedIPs set.Set
 	flushMutex sync.Mutex
@@ -216,7 +229,7 @@ func (cbs *FelixConnection) OnConfigLoaded(globalConfig map[string]string, hostC
 	cbs.toFelix <- msg
 }
 
-func (cbs *FelixConnection) OnStatusUpdated(status store.DriverStatus) {
+func (cbs *FelixConnection) OnStatusUpdated(status api.DriverStatus) {
 	statusString := "unknown"
 	switch status {
 	case store.WaitForDatastore:
@@ -283,7 +296,7 @@ func (cbs *FelixConnection) readMessagesFromFelix() {
 		msgType := msg.(map[interface{}]interface{})["type"].(string)
 		switch msgType {
 		case "init": // Hello message from felix
-			cbs.datastore.Start() // Should trigger OnConfigLoaded.
+			cbs.handleInitFromFelix(msg.(map[interface{}]interface{}))
 		default:
 			glog.Warning("XXXX Unknown message from felix: ", msg)
 		}
