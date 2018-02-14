@@ -122,7 +122,12 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 		}
 		cidr := affBlocks[0]
 		affBlocks = affBlocks[1:]
-		ips, _ = c.assignFromExistingBlock(ctx, cidr, num, handleID, attrs, host, true)
+		if c.verifyAffinity(ctx, host, cidr) {
+			ips, err = c.assignFromExistingBlock(ctx, cidr, num, handleID, attrs, host, true)
+			if err != nil {
+				log.WithError(err).Info("Couldn't assign from existing block")
+			}
+		}
 		log.Debugf("Block '%s' provided addresses: %v", cidr.String(), ips)
 	}
 
@@ -400,6 +405,32 @@ func (c ipamClient) releaseIPsFromBlock(ctx context.Context, ips []net.IP, block
 		return unallocated, nil
 	}
 	return nil, errors.New("Max retries hit - excessive concurrent IPAM requests")
+}
+
+func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR net.IPNet) bool {
+	// Lookup the affinity for this host / block.
+	k := model.BlockAffinityKey{Host: host, CIDR: blockCIDR}
+	aff, err := c.client.Get(ctx, k, "")
+	if err != nil {
+		log.WithError(err).Error("Failed to lookup block affinity")
+		return false
+	}
+
+	// If it exists, check that the affinity is not pending. If pending,
+	// clean up the affinity and return an error.
+	if aff.Value.(*model.BlockAffinity).Pending {
+		// The block affinity is pending. This means the affinity claim failed, and
+		// also failed to clean up the pending affinity. Clean it up now, and indicate that
+		// the block should not be used by returning false.
+		_, err := c.client.Delete(ctx, k, aff.Revision)
+		if err != nil {
+			log.WithError(err).Warn("Failed to clean up pending affinity claim")
+		}
+		return false
+	}
+
+	// If not pending, return successfully.
+	return true
 }
 
 func (c ipamClient) assignFromExistingBlock(

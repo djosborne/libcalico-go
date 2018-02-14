@@ -43,13 +43,17 @@ var (
 	//   as a raw-string type so that it can handle reading in any value.
 	//   We write in a fixed value of "{}" so that we are compatible with
 	//   both the Python and the original golang port.
-	BlockAffinityValue = "{}"
-	typeBlockAff       = rawStringType
+	// BlockAffinityValue = "{}"
+	typeBlockAff = reflect.TypeOf(BlockAffinity{})
 )
 
 type BlockAffinityKey struct {
 	CIDR net.IPNet `json:"-" validate:"required,name"`
 	Host string    `json:"-"`
+}
+
+type BlockAffinity struct {
+	Pending bool `json:"pending"`
 }
 
 func (key BlockAffinityKey) defaultPath() (string, error) {
