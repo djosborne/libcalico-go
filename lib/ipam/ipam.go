@@ -122,6 +122,8 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 		}
 		cidr := affBlocks[0]
 		affBlocks = affBlocks[1:]
+
+		// Only allocate from this existing block if the host->block affinity has been confirmed.
 		if c.verifyAffinity(ctx, host, cidr) {
 			ips, err = c.assignFromExistingBlock(ctx, cidr, num, handleID, attrs, host, true)
 			if err != nil {
@@ -153,6 +155,9 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 				if _, ok := err.(noFreeBlocksError); ok {
 					// No free blocks.  Break.
 					break
+				} else if _, ok := err.(errBlockClaimConflict); ok {
+					// We conflicted with another host - retry.
+					continue
 				}
 				log.Errorf("Error claiming new block: %v", err)
 				return nil, err
@@ -268,7 +273,7 @@ func (c ipamClient) AssignIP(ctx context.Context, args AssignIPArgs) error {
 				}
 				err = c.blockReaderWriter.claimBlockAffinity(ctx, blockCIDR, hostname, *cfg)
 				if err != nil {
-					if _, ok := err.(*affinityClaimedError); ok {
+					if _, ok := err.(*errBlockClaimConflict); ok {
 						log.Warningf("Someone else claimed block %s before us", blockCIDR.String())
 						continue
 					} else {
@@ -301,7 +306,9 @@ func (c ipamClient) AssignIP(ctx context.Context, args AssignIPArgs) error {
 		if err != nil {
 			log.Warningf("Update failed on block %s", block.CIDR.String())
 			if args.HandleID != nil {
-				c.decrementHandle(ctx, *args.HandleID, blockCIDR, 1)
+				if err := c.decrementHandle(ctx, *args.HandleID, blockCIDR, 1); err != nil {
+					log.WithError(err).Warn("Failed to decrement handle")
+				}
 			}
 			return err
 		}
@@ -407,6 +414,9 @@ func (c ipamClient) releaseIPsFromBlock(ctx context.Context, ips []net.IP, block
 	return nil, errors.New("Max retries hit - excessive concurrent IPAM requests")
 }
 
+// verifyAffinity verifies that the given block has a confirmed affinity for the given host, returning
+// true if confirmed and false otherwise. verifyAffinity will attempt to reconcile pending affinities
+// if it finds them.
 func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR net.IPNet) bool {
 	// Lookup the affinity for this host / block.
 	log.Infof("Verifying block %s has affinity for host %s", blockCIDR, host)
@@ -420,11 +430,12 @@ func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR n
 	// If it exists, check that the affinity is not pending. If pending and no block exists,
 	// try to claim the affinity for ourselves. If the block already belongs to another host,
 	// clean up the affinity to this host and return.
-	if aff.Value.(*model.BlockAffinity).Pending {
-		// Try to claim the block.
-		// - If it doesn't yet exist, we have a chance of claiming it for ourselves.
-		// - If it does exist but is already affine to this host, then the affinity will be confirmed.
-		// - If it does exist but is affine to another host, the affinity will be cleaned up.
+	if aff.Value.(*model.BlockAffinity).State == model.StatePending {
+		// Try to claim the block. The call to `claimBlockAffinity` will do the following:
+		// - If the block doesn't yet exist, it will attempt to claim it for ourselves.
+		// - If the block does exist but is already affine to this host, then the affinity will be confirmed.
+		// - If the block exists but is affine to another host, the pending affinity will be cleaned up.
+		log.Info("Affinity is pending - attempt to confirm")
 		cfg, err := c.GetIPAMConfig(ctx)
 		if err != nil {
 			log.WithError(err).Errorf("Failed to get IPAM Config")
@@ -438,6 +449,10 @@ func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR n
 		// We successfully claimed the pending block.
 		log.Info("Successfully claimed pending block")
 		return true
+	} else if aff.Value.(*model.BlockAffinity).State == model.StatePendingDeletion {
+		// Affinity is pending deletion and so is not valid for allocations.
+		log.Info("Affinity is pending deletion")
+		return false
 	}
 
 	// If not pending, return successfully.
@@ -531,7 +546,7 @@ func (c ipamClient) ClaimAffinity(ctx context.Context, cidr net.IPNet, host stri
 	for blockCIDR := blocks(); blockCIDR != nil; blockCIDR = blocks() {
 		err := c.blockReaderWriter.claimBlockAffinity(ctx, *blockCIDR, hostname, *cfg)
 		if err != nil {
-			if _, ok := err.(affinityClaimedError); ok {
+			if _, ok := err.(errBlockClaimConflict); ok {
 				// Claimed by someone else - add to failed list.
 				failed = append(failed, *blockCIDR)
 			} else {
@@ -567,7 +582,7 @@ func (c ipamClient) ReleaseAffinity(ctx context.Context, cidr net.IPNet, host st
 	for blockCIDR := blocks(); blockCIDR != nil; blockCIDR = blocks() {
 		err := c.blockReaderWriter.releaseBlockAffinity(ctx, hostname, *blockCIDR)
 		if err != nil {
-			if _, ok := err.(affinityClaimedError); ok {
+			if _, ok := err.(errBlockClaimConflict); ok {
 				// Not claimed by this host - ignore.
 			} else if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
 				// Block does not exist - ignore.
@@ -599,7 +614,7 @@ func (c ipamClient) ReleaseHostAffinities(ctx context.Context, host string) erro
 		for _, blockCIDR := range blockCIDRs {
 			err := c.ReleaseAffinity(ctx, blockCIDR, hostname)
 			if err != nil {
-				if _, ok := err.(affinityClaimedError); ok {
+				if _, ok := err.(errBlockClaimConflict); ok {
 					// Claimed by a different host.
 				} else {
 					return err
@@ -630,7 +645,7 @@ func (c ipamClient) ReleasePoolAffinities(ctx context.Context, pool net.IPNet) e
 			_, blockCIDR, _ := net.ParseCIDR(blockString)
 			err = c.blockReaderWriter.releaseBlockAffinity(ctx, host, *blockCIDR)
 			if err != nil {
-				if _, ok := err.(affinityClaimedError); ok {
+				if _, ok := err.(errBlockClaimConflict); ok {
 					retry = true
 				} else if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
 					log.Debugf("No such block '%s'", blockCIDR.String())
@@ -662,18 +677,38 @@ func (c ipamClient) RemoveIPAMHost(ctx context.Context, host string) error {
 	}
 
 	// Release affinities for this host.
-	c.ReleaseHostAffinities(ctx, hostname)
+	if err := c.ReleaseHostAffinities(ctx, hostname); err != nil {
+		log.WithError(err).Errorf("Failed to release IPAM affinities for host")
+		return err
+	}
 
-	// Remove the host tree from the datastore.
-	_, err = c.client.Delete(ctx, model.IPAMHostKey{Host: hostname}, "")
-	if err != nil {
-		// Return the error unless the resource does not exist.
-		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
-			log.Errorf("Error removing IPAM host: %v", err)
+	for i := 0; i < ipamEtcdRetries; i++ {
+		// Get the IPAM host.
+		k := model.IPAMHostKey{Host: hostname}
+		kvp, err := c.client.Get(ctx, k, "")
+		if err != nil {
+			log.WithError(err).Errorf("Failed to get IPAM host")
 			return err
 		}
+
+		// Remove the host tree from the datastore.
+		_, err = c.client.Delete(ctx, k, kvp.Revision)
+		if err != nil {
+			if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+				// We hit a compare-and-delete error - retry.
+				continue
+			}
+
+			// Return the error unless the resource does not exist.
+			if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
+				log.Errorf("Error removing IPAM host: %v", err)
+				return err
+			}
+		}
+		return nil
 	}
-	return nil
+
+	return errors.New("Max retries hit")
 }
 
 func (c ipamClient) hostBlockPairs(ctx context.Context, pool net.IPNet) (map[string]string, error) {
@@ -767,7 +802,7 @@ func (c ipamClient) releaseByHandle(ctx context.Context, handleID string, blockC
 		}
 
 		if block.empty() && block.Affinity == nil {
-			_, err = c.client.Delete(ctx, model.BlockKey{blockCIDR}, "")
+			_, err = c.client.Delete(ctx, model.BlockKey{blockCIDR}, obj.Revision)
 			if err != nil {
 				// Return the error unless the resource does not exist.
 				if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
@@ -831,7 +866,7 @@ func (c ipamClient) incrementHandle(ctx context.Context, handleID string, blockC
 		// Compare and swap the handle using the KVPair from above.  We've been
 		// manipulating the structure in the KVPair, so pass straight back to
 		// apply the changes.
-		_, err = c.client.Apply(ctx, obj)
+		_, err = c.client.Update(ctx, obj)
 		if err != nil {
 			continue
 		}

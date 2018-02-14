@@ -200,6 +200,212 @@ var _ = testutils.E2eDatastoreDescribe("IPAM tests", testutils.DatastoreEtcdV3, 
 		})
 	})
 
+	Context("test verifyAffinity", func() {
+
+		var (
+			ic  *ipamClient
+			p   *ipPoolAccessor
+			bc  bapi.Client
+			ctx context.Context
+		)
+
+		BeforeEach(func() {
+			var err error
+
+			// Make the client and clean the data store.
+			bc, err = backend.NewClient(config)
+			Expect(err).NotTo(HaveOccurred())
+			bc.Clean()
+
+			p = &ipPoolAccessor{pools: map[string]bool{}}
+			ic = &ipamClient{
+				client: bc,
+				pools:  p,
+				blockReaderWriter: blockReaderWriter{
+					client: bc,
+					pools:  p,
+				},
+			}
+			ctx = context.Background()
+		})
+
+		It("should clean up pending block affinity when another block has claimed it", func() {
+			By("creating a backend client", func() {
+				var err error
+				bc, err = backend.NewClient(config)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			var net *cnet.IPNet
+			By("picking a block cidr", func() {
+				var err error
+				_, net, err = cnet.ParseCIDR("10.1.0.0/26")
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming affinity for a block on another host", func() {
+				kvp := &model.KVPair{
+					Key:   model.BlockAffinityKey{CIDR: *net, Host: "host-1"},
+					Value: &model.BlockAffinity{State: model.StateConfirmed},
+				}
+				_, err := bc.Create(ctx, kvp)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming block on another host", func() {
+				aff := "host-1"
+				kvp := &model.KVPair{
+					Key: model.BlockKey{CIDR: *net},
+					Value: &model.AllocationBlock{
+						CIDR:     *net,
+						Affinity: &aff,
+					},
+				}
+				_, err := bc.Create(ctx, kvp)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming a pending affinity for a block on this host", func() {
+				kvp := &model.KVPair{
+					Key:   model.BlockAffinityKey{CIDR: *net, Host: "host-2"},
+					Value: &model.BlockAffinity{State: model.StatePending},
+				}
+				_, err := bc.Create(ctx, kvp)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("verifying the affinity of the first host", func() {
+				valid := ic.verifyAffinity(ctx, "host-1", *net)
+				Expect(valid).To(BeTrue())
+			})
+
+			By("verifying the affinity of the second host", func() {
+				valid := ic.verifyAffinity(ctx, "host-2", *net)
+				Expect(valid).NotTo(BeTrue())
+			})
+
+			By("confirming the affinity for the second host has been removed", func() {
+				k := model.BlockAffinityKey{CIDR: *net, Host: "host-2"}
+				_, err := bc.Get(ctx, k, "")
+				Expect(err).To(HaveOccurred())
+			})
+		})
+
+		It("should finish allocating a block when an affinity exists on this host", func() {
+			By("creating a backend client", func() {
+				var err error
+				bc, err = backend.NewClient(config)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			var net *cnet.IPNet
+			By("picking a block cidr", func() {
+				var err error
+				_, net, err = cnet.ParseCIDR("10.1.0.0/26")
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming a pending affinity for a block on this host", func() {
+				kvp := &model.KVPair{
+					Key:   model.BlockAffinityKey{CIDR: *net, Host: "host-1"},
+					Value: &model.BlockAffinity{State: model.StatePending},
+				}
+				_, err := bc.Create(ctx, kvp)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("verifying the affinity of the second host", func() {
+				valid := ic.verifyAffinity(ctx, "host-1", *net)
+				Expect(valid).To(BeTrue())
+			})
+
+			By("confirming the block has been created", func() {
+				k := model.BlockKey{CIDR: *net}
+				_, err := bc.Get(ctx, k, "")
+				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
+		It("should confirm a pending affinity that belongs to this host", func() {
+			By("creating a backend client", func() {
+				var err error
+				bc, err = backend.NewClient(config)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			var net *cnet.IPNet
+			By("picking a block cidr", func() {
+				var err error
+				_, net, err = cnet.ParseCIDR("10.1.0.0/26")
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming a pending affinity for a block on this host", func() {
+				kvp := &model.KVPair{
+					Key:   model.BlockAffinityKey{CIDR: *net, Host: "host-1"},
+					Value: &model.BlockAffinity{State: model.StatePending},
+				}
+				_, err := bc.Create(ctx, kvp)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming the block on this host", func() {
+				aff := "host:host-1"
+				kvp := &model.KVPair{
+					Key: model.BlockKey{CIDR: *net},
+					Value: &model.AllocationBlock{
+						CIDR:     *net,
+						Affinity: &aff,
+					},
+				}
+				_, err := bc.Create(ctx, kvp)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("verifying the affinity", func() {
+				valid := ic.verifyAffinity(ctx, "host-1", *net)
+				Expect(valid).To(BeTrue())
+			})
+
+			By("confirming the affinity is now confirmed", func() {
+				k := model.BlockAffinityKey{CIDR: *net, Host: "host-1"}
+				kvp, err := bc.Get(ctx, k, "")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(kvp.Value.(*model.BlockAffinity).State).To(Equal(model.StateConfirmed))
+			})
+		})
+
+		It("should not verify an affinity that is pending deletion", func() {
+			By("creating a backend client", func() {
+				var err error
+				bc, err = backend.NewClient(config)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			var net *cnet.IPNet
+			By("picking a block cidr", func() {
+				var err error
+				_, net, err = cnet.ParseCIDR("10.1.0.0/26")
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming an affinity for a block on this host that is pending deletion", func() {
+				kvp := &model.KVPair{
+					Key:   model.BlockAffinityKey{CIDR: *net, Host: "host-1"},
+					Value: &model.BlockAffinity{State: model.StatePendingDeletion},
+				}
+				_, err := bc.Create(ctx, kvp)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("not verifying the affinity", func() {
+				valid := ic.verifyAffinity(ctx, "host-1", *net)
+				Expect(valid).NotTo(BeTrue())
+			})
+		})
+
+	})
+
 	Describe("IPAM AutoAssign from different pools", func() {
 		host := "host-A"
 		pool1 := cnet.MustParseNetwork("10.0.0.0/24")

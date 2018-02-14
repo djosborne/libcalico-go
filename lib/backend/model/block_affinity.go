@@ -47,13 +47,21 @@ var (
 	typeBlockAff = reflect.TypeOf(BlockAffinity{})
 )
 
+type BlockAffinityState string
+
+const (
+	StateConfirmed       BlockAffinityState = ""
+	StatePending         BlockAffinityState = "pending"
+	StatePendingDeletion BlockAffinityState = "pendingDeletion"
+)
+
 type BlockAffinityKey struct {
 	CIDR net.IPNet `json:"-" validate:"required,name"`
 	Host string    `json:"-"`
 }
 
 type BlockAffinity struct {
-	Pending bool `json:"pending"`
+	State BlockAffinityState `json:"state"`
 }
 
 func (key BlockAffinityKey) defaultPath() (string, error) {
