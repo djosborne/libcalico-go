@@ -292,6 +292,13 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 	})
 
 	Context("IPAM block allocation race conditions", func() {
+
+		BeforeEach(func() {
+			bc, err := backend.NewClient(config)
+			Expect(err).NotTo(HaveOccurred())
+			bc.Clean()
+		})
+
 		It("should clean up pending block allocations", func() {
 			var bc api.Client
 			By("creating a backend client", func() {
@@ -363,6 +370,53 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 				Expect(err).To(HaveOccurred())
 			})
 		})
+
+		It("should finish allocating a block", func() {
+			var bc api.Client
+			By("creating a backend client", func() {
+				var err error
+				bc, err = backend.NewClient(config)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			var net *cnet.IPNet
+			By("picking a block cidr", func() {
+				var err error
+				_, net, err = cnet.ParseCIDR("10.1.0.0/26")
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming a pending affinity for a block on this host", func() {
+				kvp := &model.KVPair{
+					Key:   model.BlockAffinityKey{CIDR: *net, Host: "host-1"},
+					Value: &model.BlockAffinity{Pending: true},
+				}
+				_, err := bc.Create(ctx, kvp)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			p := &ipPoolAccessor{pools: map[string]bool{}}
+			ic := &ipamClient{
+				client: bc,
+				pools:  p,
+				blockReaderWriter: blockReaderWriter{
+					client: bc,
+					pools:  p,
+				},
+			}
+
+			By("verifying the affinity of the second host", func() {
+				valid := ic.verifyAffinity(ctx, "host-1", *net)
+				Expect(valid).To(BeTrue())
+			})
+
+			By("confirming the block has been created", func() {
+				k := model.BlockKey{CIDR: *net}
+				_, err := bc.Get(ctx, k, "")
+				Expect(err).NotTo(HaveOccurred())
+			})
+		})
+
 	})
 
 })
