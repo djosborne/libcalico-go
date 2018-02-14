@@ -138,18 +138,18 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 			// Creation function for a block affinity - actually create it.
 			affKVP := &model.KVPair{
 				Key:   model.BlockAffinityKey{Host: host, CIDR: *net},
-				Value: model.BlockAffinityValue,
+				Value: model.BlockAffinity{},
 			}
 			affKVP2 := &model.KVPair{
 				Key:   model.BlockAffinityKey{Host: otherHost, CIDR: *net},
-				Value: model.BlockAffinityValue,
+				Value: model.BlockAffinity{},
 			}
 
 			fc.createFuncs[fmt.Sprintf("%s", affKVP.Key)] = func(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
 				// Create the affinity for the other racing host.
 				_, err := bc.Create(ctx, affKVP2)
 				if err != nil {
-					panic(err)
+					return nil, err
 				}
 
 				// And create it for the host requesting it.
@@ -176,15 +176,18 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 				Value: b2.AllocationBlock,
 			}
 			fc.createFuncs[fmt.Sprintf("%s", blockKVP.Key)] = func(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
-				// Create the "stolen" affinity from the other host.
-				bc.Create(ctx, blockKVP2)
+				// Create the "stolen" affinity from the other racing host.
+				_, err := bc.Create(ctx, blockKVP2)
+				if err != nil {
+					return nil, err
+				}
 
 				// Return that the object already exists.
 				return nil, cerrors.ErrorResourceAlreadyExists{}
 			}
 
-			// Get function for the block. The first time, it should return nil to indicate nobody has the block. On the second call,
-			// return the same block but owned by another host, simulating the race condition under test.
+			// Get function for the block. The first time, it should return nil to indicate nobody has the block. On subsequent calls,
+			// return the real data from etcd representing the block belonging to another host.
 			calls := 0
 			fc.getFuncs[fmt.Sprintf("%s", blockKVP.Key)] = func(ctx context.Context, k model.Key, r string) (*model.KVPair, error) {
 				return func(ctx context.Context, k model.Key, r string) (*model.KVPair, error) {
@@ -193,12 +196,8 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 					if calls == 1 {
 						// First time the block doesn't exist yet.
 						return nil, cerrors.ErrorResourceDoesNotExist{}
-					} else if calls == 2 {
-						// Second time, it has been claimed by another host.
-						return blockKVP2, nil
 					}
-					panic("Unexpected GET call")
-					return nil, nil
+					return bc.Get(ctx, k, r)
 				}(ctx, k, r)
 			}
 
@@ -208,11 +207,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 				return nil, fmt.Errorf("block affinity deletion failure")
 			}
 
-			// List function should return no affinities - this triggers the allocation of a new block.
-			opts := model.BlockAffinityListOptions{Host: host, IPVersion: ipv4.Number}
-			fc.listFuncs[fmt.Sprintf("%s", opts)] = func(ctx context.Context, list model.ListInterface, revision string) (*model.KVPairList, error) {
-				return bc.List(ctx, list, revision)
-			}
+			// List function should behave normally.
 			fc.listFuncs["default"] = func(ctx context.Context, list model.ListInterface, revision string) (*model.KVPairList, error) {
 				return bc.List(ctx, list, revision)
 			}
@@ -228,16 +223,16 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 			}
 
 			By("attempting to claim the block on multiple hosts at the same time", func() {
-				// icfg := IPAMConfig{}
-				// err := rw.claimBlockAffinity(ctx, *net, host, icfg)
-				_, err := ipamClient.autoAssign(ctx, 1, nil, nil, nil, ipv4, host)
+				ips, err := ipamClient.autoAssign(ctx, 1, nil, nil, nil, ipv4, host)
 
-				// It should return an error indicating that it failed to clean up the
-				// affinity block.
-				Expect(err).To(HaveOccurred())
+				// Shouldn't return an error.
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should return a single IP.
+				Expect(len(ips)).To(Equal(1))
 			})
 
-			By("checking that the other host received the affinity", func() {
+			By("checking that the other host has the affinity", func() {
 				// The block should have the affinity field set properly.
 				opts := model.BlockAffinityListOptions{Host: otherHost}
 				objs, err := rw.client.List(ctx, opts, "")
@@ -245,9 +240,29 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 				// Should be a single block affinity, assigned to the other host.
 				Expect(len(objs.KVPairs)).To(Equal(1))
+				Expect(objs.KVPairs[0].Value.(*model.BlockAffinity).Pending).NotTo(BeTrue())
 			})
 
-			By("checking that the test host did not receive the affinity", func() {
+			By("checking that the test host has a pending affinity", func() {
+				// The block should have the affinity field set properly.
+				opts := model.BlockAffinityListOptions{Host: host}
+				objs, err := rw.client.List(ctx, opts, "")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(len(objs.KVPairs)).To(Equal(1))
+				Expect(objs.KVPairs[0].Value.(*model.BlockAffinity).Pending).To(BeTrue())
+			})
+
+			By("attempting to claim another address", func() {
+				ips, err := ipamClient.autoAssign(ctx, 1, nil, nil, nil, ipv4, host)
+
+				// Shouldn't return an error.
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should return a single IP.
+				Expect(len(ips)).To(Equal(1))
+			})
+
+			By("checking that the pending affinity was cleaned up", func() {
 				// The block should have the affinity field set properly.
 				opts := model.BlockAffinityListOptions{Host: host}
 				objs, err := rw.client.List(ctx, opts, "")
@@ -258,5 +273,4 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 			})
 		})
 	})
-
 })
