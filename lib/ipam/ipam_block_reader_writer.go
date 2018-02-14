@@ -182,13 +182,20 @@ func (rw blockReaderWriter) claimBlockAffinity(ctx context.Context, subnet cnet.
 		Key:   model.BlockAffinityKey{Host: host, CIDR: subnet},
 		Value: model.BlockAffinity{Pending: true},
 	}
-	_, err := rw.client.Create(ctx, &obj)
+	aff, err := rw.client.Create(ctx, &obj)
 	if err != nil {
 		if _, ok := err.(cerrors.ErrorResourceAlreadyExists); !ok {
 			log.WithError(err).Error("Failed to claim affinity")
 			return err
 		}
-		log.Info("Block affinity already exists, continuing")
+		log.Info("Block affinity already exists")
+
+		// Get the existing affinity in order to get revision information.
+		aff, err = rw.client.Get(ctx, obj.Key, "")
+		if err != nil {
+			log.WithError(err).Error("Failed to get existing affinity")
+			return err
+		}
 	}
 
 	// Create the new block.
@@ -222,12 +229,12 @@ func (rw blockReaderWriter) claimBlockAffinity(ctx context.Context, subnet cnet.
 			if b.Affinity != nil && *b.Affinity == affinityKeyStr {
 				// Block has affinity to this host, meaning another
 				// process on this host claimed it.
-				log.Debugf("Block %s already claimed by us.  Success", subnet)
-				return nil
+				log.Debugf("Block %s already claimed by us.", subnet)
+				return rw.confirmAffinity(ctx, host, subnet)
 			}
 
 			// Some other host beat us to this block.  Cleanup and return an error.
-			_, err = rw.client.Delete(ctx, model.BlockAffinityKey{Host: host, CIDR: b.CIDR}, "")
+			_, err = rw.client.Delete(ctx, model.BlockAffinityKey{Host: host, CIDR: b.CIDR}, aff.Revision)
 			if err != nil {
 				// Failed to clean up our claim to this block.
 				log.WithError(err).Errorf("Error cleaning up block affinity after failed claim")
@@ -240,17 +247,20 @@ func (rw blockReaderWriter) claimBlockAffinity(ctx context.Context, subnet cnet.
 	}
 
 	// We've successfully claimed the block - confirm the affinity.
-	obj = model.KVPair{
-		Key:   model.BlockAffinityKey{Host: host, CIDR: subnet},
+	return rw.confirmAffinity(ctx, host, subnet)
+}
+
+func (rw blockReaderWriter) confirmAffinity(ctx context.Context, host string, cidr cnet.IPNet) error {
+	obj := model.KVPair{
+		Key:   model.BlockAffinityKey{Host: host, CIDR: cidr},
 		Value: model.BlockAffinity{Pending: false},
 	}
-	_, err = rw.client.Apply(ctx, &obj)
+	log.Debugf("Confirming affinity: %s -> %s", host, cidr)
+	_, err := rw.client.Apply(ctx, &obj)
 	if err != nil {
-		// CD: Do we need to try to delete the block here?
 		log.WithError(err).Error("Failed to confirm block affinity")
 		return err
 	}
-
 	return nil
 }
 

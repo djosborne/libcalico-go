@@ -76,6 +76,8 @@ func (c *fakeClient) Delete(ctx context.Context, key model.Key, revision string)
 func (c *fakeClient) Get(ctx context.Context, key model.Key, revision string) (*model.KVPair, error) {
 	if f, ok := c.getFuncs[fmt.Sprintf("%s", key)]; ok {
 		return f(ctx, key, revision)
+	} else if f, ok := c.getFuncs["default"]; ok {
+		return f(ctx, key, revision)
 	}
 	panic(fmt.Sprintf("Get called on unexpected object: %+v", key))
 	return nil, nil
@@ -201,10 +203,25 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 				}(ctx, k, r)
 			}
 
+			fc.getFuncs["default"] = func(ctx context.Context, k model.Key, r string) (*model.KVPair, error) {
+				return bc.Get(ctx, k, r)
+			}
+
 			// Delete function for the affinity - this should fail, triggering the scenario under test where two hosts now think they
 			// have affinity to the block.
+			deleteCalls := 0
 			fc.deleteFuncs[fmt.Sprintf("%s", affKVP.Key)] = func(ctx context.Context, k model.Key, r string) (*model.KVPair, error) {
-				return nil, fmt.Errorf("block affinity deletion failure")
+				return func(ctx context.Context, k model.Key, r string) (*model.KVPair, error) {
+					deleteCalls = deleteCalls + 1
+
+					if deleteCalls == 1 {
+						// First time around, the delete fails - this triggers the scenario.
+						return nil, fmt.Errorf("block affinity deletion failure")
+					}
+
+					// Subsequent calls succeed.
+					return bc.Delete(ctx, k, r)
+				}(ctx, k, r)
 			}
 
 			// List function should behave normally.

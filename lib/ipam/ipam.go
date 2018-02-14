@@ -409,6 +409,7 @@ func (c ipamClient) releaseIPsFromBlock(ctx context.Context, ips []net.IP, block
 
 func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR net.IPNet) bool {
 	// Lookup the affinity for this host / block.
+	log.Infof("Verifying block %s has affinity for host %s", blockCIDR, host)
 	k := model.BlockAffinityKey{Host: host, CIDR: blockCIDR}
 	aff, err := c.client.Get(ctx, k, "")
 	if err != nil {
@@ -416,17 +417,27 @@ func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR n
 		return false
 	}
 
-	// If it exists, check that the affinity is not pending. If pending,
-	// clean up the affinity and return an error.
+	// If it exists, check that the affinity is not pending. If pending and no block exists,
+	// try to claim the affinity for ourselves. If the block already belongs to another host,
+	// clean up the affinity to this host and return.
 	if aff.Value.(*model.BlockAffinity).Pending {
-		// The block affinity is pending. This means the affinity claim failed, and
-		// also failed to clean up the pending affinity. Clean it up now, and indicate that
-		// the block should not be used by returning false.
-		_, err := c.client.Delete(ctx, k, aff.Revision)
+		// Try to claim the block.
+		// - If it doesn't yet exist, we have a chance of claiming it for ourselves.
+		// - If it does exist but is already affine to this host, then the affinity will be confirmed.
+		// - If it does exist but is affine to another host, the affinity will be cleaned up.
+		cfg, err := c.GetIPAMConfig(ctx)
 		if err != nil {
-			log.WithError(err).Warn("Failed to clean up pending affinity claim")
+			log.WithError(err).Errorf("Failed to get IPAM Config")
+			return false
 		}
-		return false
+		if err := c.blockReaderWriter.claimBlockAffinity(ctx, blockCIDR, host, *cfg); err != nil {
+			log.Info("Failed to claim pending affinity")
+			return false
+		}
+
+		// We successfully claimed the pending block.
+		log.Info("Successfully claimed pending block")
+		return true
 	}
 
 	// If not pending, return successfully.
@@ -532,7 +543,6 @@ func (c ipamClient) ClaimAffinity(ctx context.Context, cidr net.IPNet, host stri
 		}
 	}
 	return claimed, failed, nil
-
 }
 
 // ReleaseAffinity releases affinity for all blocks within the given CIDR
