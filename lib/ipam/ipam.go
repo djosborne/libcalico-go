@@ -415,8 +415,8 @@ func (c ipamClient) releaseIPsFromBlock(ctx context.Context, ips []net.IP, block
 }
 
 // verifyAffinity verifies that the given block has a confirmed affinity for the given host, returning
-// true if confirmed and false otherwise. verifyAffinity will attempt to reconcile pending affinities
-// if it finds them.
+// true if confirmed and false otherwise. verifyAffinity will attempt to reconcile the affinity if it
+// exists but is pending.
 func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR net.IPNet) bool {
 	// Lookup the affinity for this host / block.
 	log.Infof("Verifying block %s has affinity for host %s", blockCIDR, host)
@@ -435,15 +435,24 @@ func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR n
 		// - If the block doesn't yet exist, it will attempt to claim it for ourselves.
 		// - If the block does exist but is already affine to this host, then the affinity will be confirmed.
 		// - If the block exists but is affine to another host, the pending affinity will be cleaned up.
-		log.Info("Affinity is pending - attempt to confirm")
-		cfg, err := c.GetIPAMConfig(ctx)
-		if err != nil {
-			log.WithError(err).Errorf("Failed to get IPAM Config")
-			return false
-		}
-		if err := c.blockReaderWriter.claimBlockAffinity(ctx, blockCIDR, host, *cfg); err != nil {
-			log.Info("Failed to claim pending affinity")
-			return false
+		for i := 0; i < ipamEtcdRetries; i++ {
+			log.Info("Affinity is pending - attempt to confirm")
+			cfg, err := c.GetIPAMConfig(ctx)
+			if err != nil {
+				log.WithError(err).Errorf("Failed to get IPAM Config")
+				return false
+			}
+			if err := c.blockReaderWriter.claimBlockAffinity(ctx, blockCIDR, host, *cfg); err != nil {
+				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+					// We hit an update conflict trying to confirm the affinity - this could mean
+					// another process on this host has confirmed the affinity, or that the affinity
+					// has been deleted while we were trying to confirm it.
+					// CD: If it's deleted, do we want to retry here?
+					continue
+				}
+				log.Info("Failed to claim pending affinity")
+				return false
+			}
 		}
 
 		// We successfully claimed the pending block.

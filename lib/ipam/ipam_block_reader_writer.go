@@ -131,17 +131,19 @@ func (rw blockReaderWriter) claimNewAffineBlock(ctx context.Context, host string
 				if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
 					// The block does not yet exist in etcd.  Try to grab it.
 					log.Infof("Found free block: %+v", *subnet)
-					err = rw.claimBlockAffinity(ctx, *subnet, host, config)
-					if err != nil {
-						if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-							// We hit a conflict with another host - retry.
-							log.Debug("Resource conflict error - retrying claim")
-							continue
+					for i := 0; i < ipamEtcdRetries; i++ {
+						err = rw.claimBlockAffinity(ctx, *subnet, host, config)
+						if err != nil {
+							if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+								// We hit an update conflict when confirming the affinity - retry.
+								log.Debug("Resource conflict error - retrying claim")
+								continue
+							}
+							log.WithError(err).Warnf("Failed to claim block affinity")
+							return nil, err
 						}
-						log.WithError(err).Warnf("Failed to claim block affinity")
-						return nil, err
+						return subnet, err
 					}
-					return subnet, err
 				} else {
 					log.Errorf("Error getting block: %v", err)
 					return nil, err
@@ -311,6 +313,7 @@ func (rw blockReaderWriter) releaseBlockAffinity(ctx context.Context, host strin
 
 		if b.empty() {
 			// If the block is empty, we can delete it.
+			log.Debug("Block is empty - delete it")
 			_, err := rw.client.Delete(ctx, model.BlockKey{CIDR: b.CIDR}, obj.Revision)
 			if err != nil {
 				// Return the error unless the block didn't exist.
@@ -324,6 +327,7 @@ func (rw blockReaderWriter) releaseBlockAffinity(ctx context.Context, host strin
 			// This prevents the host from automatically assigning
 			// from this block unless we're allowed to overflow into
 			// non-affine blocks.
+			log.Debug("Block is not empty - remove the affinity")
 			b.Affinity = nil
 
 			// Pass back the original KVPair with the new

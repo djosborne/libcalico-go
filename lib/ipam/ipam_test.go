@@ -230,12 +230,6 @@ var _ = testutils.E2eDatastoreDescribe("IPAM tests", testutils.DatastoreEtcdV3, 
 		})
 
 		It("should clean up pending block affinity when another block has claimed it", func() {
-			By("creating a backend client", func() {
-				var err error
-				bc, err = backend.NewClient(config)
-				Expect(err).NotTo(HaveOccurred())
-			})
-
 			var net *cnet.IPNet
 			By("picking a block cidr", func() {
 				var err error
@@ -292,12 +286,6 @@ var _ = testutils.E2eDatastoreDescribe("IPAM tests", testutils.DatastoreEtcdV3, 
 		})
 
 		It("should finish allocating a block when an affinity exists on this host", func() {
-			By("creating a backend client", func() {
-				var err error
-				bc, err = backend.NewClient(config)
-				Expect(err).NotTo(HaveOccurred())
-			})
-
 			var net *cnet.IPNet
 			By("picking a block cidr", func() {
 				var err error
@@ -327,12 +315,6 @@ var _ = testutils.E2eDatastoreDescribe("IPAM tests", testutils.DatastoreEtcdV3, 
 		})
 
 		It("should confirm a pending affinity that belongs to this host", func() {
-			By("creating a backend client", func() {
-				var err error
-				bc, err = backend.NewClient(config)
-				Expect(err).NotTo(HaveOccurred())
-			})
-
 			var net *cnet.IPNet
 			By("picking a block cidr", func() {
 				var err error
@@ -376,12 +358,6 @@ var _ = testutils.E2eDatastoreDescribe("IPAM tests", testutils.DatastoreEtcdV3, 
 		})
 
 		It("should not verify an affinity that is pending deletion", func() {
-			By("creating a backend client", func() {
-				var err error
-				bc, err = backend.NewClient(config)
-				Expect(err).NotTo(HaveOccurred())
-			})
-
 			var net *cnet.IPNet
 			By("picking a block cidr", func() {
 				var err error

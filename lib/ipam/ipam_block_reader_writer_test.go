@@ -35,6 +35,7 @@ import (
 func newFakeClient() *fakeClient {
 	return &fakeClient{
 		createFuncs: map[string]func(ctx context.Context, object *model.KVPair) (*model.KVPair, error){},
+		updateFuncs: map[string]func(ctx context.Context, object *model.KVPair) (*model.KVPair, error){},
 		getFuncs:    map[string]func(ctx context.Context, key model.Key, revision string) (*model.KVPair, error){},
 		deleteFuncs: map[string]func(ctx context.Context, key model.Key, revision string) (*model.KVPair, error){},
 		listFuncs:   map[string]func(ctx context.Context, list model.ListInterface, revision string) (*model.KVPairList, error){},
@@ -44,6 +45,7 @@ func newFakeClient() *fakeClient {
 // fakeClient implements the backend api.Client interface.
 type fakeClient struct {
 	createFuncs map[string]func(ctx context.Context, object *model.KVPair) (*model.KVPair, error)
+	updateFuncs map[string]func(ctx context.Context, object *model.KVPair) (*model.KVPair, error)
 	getFuncs    map[string]func(ctx context.Context, key model.Key, revision string) (*model.KVPair, error)
 	deleteFuncs map[string]func(ctx context.Context, key model.Key, revision string) (*model.KVPair, error)
 	listFuncs   map[string]func(ctx context.Context, list model.ListInterface, revision string) (*model.KVPairList, error)
@@ -54,13 +56,22 @@ type fakeClient struct {
 func (c *fakeClient) Create(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
 	if f, ok := c.createFuncs[fmt.Sprintf("%s", object.Key)]; ok {
 		return f(ctx, object)
+	} else if f, ok := c.createFuncs["default"]; ok {
+		return f(ctx, object)
 	}
+
 	panic(fmt.Sprintf("Create called on unexpected object: %+v", object))
 	return nil, nil
 }
 func (c *fakeClient) Update(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
-	panic("should not be called")
+	if f, ok := c.updateFuncs[fmt.Sprintf("%s", object.Key)]; ok {
+		return f(ctx, object)
+	} else if f, ok := c.updateFuncs["default"]; ok {
+		return f(ctx, object)
+	}
+	panic(fmt.Sprintf("Create called on unexpected object: %+v", object))
 	return nil, nil
+
 }
 func (c *fakeClient) Apply(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
 	panic("should not be called")
@@ -69,7 +80,10 @@ func (c *fakeClient) Apply(ctx context.Context, object *model.KVPair) (*model.KV
 func (c *fakeClient) Delete(ctx context.Context, key model.Key, revision string) (*model.KVPair, error) {
 	if f, ok := c.deleteFuncs[fmt.Sprintf("%s", key)]; ok {
 		return f(ctx, key, revision)
+	} else if f, ok := c.deleteFuncs["default"]; ok {
+		return f(ctx, key, revision)
 	}
+
 	panic(fmt.Sprintf("Delete called on unexpected object: %+v", key))
 	return nil, nil
 }
@@ -112,26 +126,188 @@ func (c *fakeClient) Watch(ctx context.Context, list model.ListInterface, revisi
 
 var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.DatastoreEtcdV3, func(config apiconfig.CalicoAPIConfig) {
 
-	ctx := context.Background()
 	log.SetLevel(log.DebugLevel)
 
 	Context("IPAM block allocation race conditions (mocked client)", func() {
-		It("should support multiple async block affinity claims on the same block", func() {
-			var bc api.Client
-			By("creating a backend client", func() {
-				var err error
-				bc, err = backend.NewClient(config)
-				Expect(err).NotTo(HaveOccurred())
+
+		var (
+			bc           api.Client
+			net          *cnet.IPNet
+			ctx          context.Context
+			hostA, hostB string
+			fc           *fakeClient
+			pools        *ipPoolAccessor
+			rw           blockReaderWriter
+			ic           *ipamClient
+		)
+
+		BeforeEach(func() {
+			var err error
+
+			// Make the client and clean the data store.
+			bc, err = backend.NewClient(config)
+			Expect(err).NotTo(HaveOccurred())
+			bc.Clean()
+
+			hostA = "hostA"
+			hostB = "hostB"
+
+			pools = &ipPoolAccessor{pools: map[string]bool{"10.0.0.0/26": true}}
+
+			ctx = context.Background()
+
+			_, net, err = cnet.ParseCIDR("10.0.0.0/26")
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should handle releasing an affinity while another claim has created the block", func() {
+			// Tests the scenario where:
+			// - hostA proc1 marks the affinity pending
+			// - hostA proc1 creates the block
+			// - hostA proc2 marks the affinity pending delete.
+			// - hostA proc2 deletes the block
+			// - hostA proc1 tries to confirm the affinity.
+			// - hostA proc2 deletes the affinity (not included in test).
+			// Expect that hostA proc 1 fails to confirm the affinity, leaving it in pending state.
+
+			blockKVP := model.KVPair{
+				Key:   model.BlockKey{CIDR: *net},
+				Value: &model.AllocationBlock{},
+			}
+			affinityKVP := model.KVPair{
+				Key:   model.BlockAffinityKey{Host: hostA, CIDR: *net},
+				Value: &model.BlockAffinity{},
+			}
+
+			By("setting up the client for the test", func() {
+				fc = newFakeClient()
+
+				// Sneak in a side-effect such that when hostA-proc1 tries to create the block,
+				// it actually simulates the other process marking the affinity as pending delete
+				// and deletes the block.
+				fc.createFuncs[fmt.Sprintf("%s", blockKVP.Key)] = func(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
+					// Mark the affinity pending deletion.
+					affinityKVP.Value.(*model.BlockAffinity).State = model.StatePendingDeletion
+					_, err := bc.Apply(ctx, &affinityKVP)
+					if err != nil {
+						panic(err)
+					}
+
+					// Don't actually create the block (simulates another process deleting it), but return it
+					// so the calling code thinks it succeeded.
+					return object, nil
+				}
+
+				// For any other objects, just create/update them as normal.
+				fc.createFuncs["default"] = func(ctx context.Context, object *model.KVPair) (*model.KVPair, error) { return bc.Create(ctx, object) }
+				fc.updateFuncs["default"] = func(ctx context.Context, object *model.KVPair) (*model.KVPair, error) { return bc.Update(ctx, object) }
+
+				rw = blockReaderWriter{client: fc, pools: pools}
+				ic = &ipamClient{
+					client:            bc,
+					pools:             pools,
+					blockReaderWriter: rw,
+				}
 			})
 
-			host := "ipam-test-host"
-			otherHost := "another-host"
-			var net *cnet.IPNet
-			By("picking a block cidr", func() {
-				var err error
-				_, net, err = cnet.ParseCIDR("10.0.0.0/26")
-				Expect(err).NotTo(HaveOccurred())
+			By("attempting to claim the block", func() {
+				config := IPAMConfig{}
+				err := rw.claimBlockAffinity(ctx, *net, hostA, config)
+				Expect(err).NotTo(BeNil())
+
+				// Should hit a resource update conflict.
+				_, ok := err.(cerrors.ErrorResourceUpdateConflict)
+				Expect(ok).To(BeTrue())
 			})
+
+			By("verifying that hostA was not able to claim the affinity as confirmed", func() {
+				// On a real system, the releasing process would delete the affinity, but since this
+				// is a mock the best we can do is assert that the affinity hasn't been confirmed by the
+				// affinity claim request.
+				a, err := bc.Get(ctx, affinityKVP.Key, "")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(a.Value.(*model.BlockAffinity).State).NotTo(Equal(model.StateConfirmed))
+			})
+		})
+
+		It("should handle claiming an affinity while it is being deleted", func() {
+			// Tests the scenario where:
+			// - hostA proc1 marks the affinity pending deletion.
+			// - hostA proc1 deletes the block.
+			// - hostA proc2 marks the affinity pending.
+			// - hostA proc2 creates the block.
+			// - hostA proc1 tries to delete the affinity.
+
+			var (
+				blockKVP, affinityKVP model.KVPair
+			)
+
+			By("setting up the client for the test", func() {
+				b := newBlock(*net)
+				blockKVP = model.KVPair{
+					Key:   model.BlockKey{CIDR: *net},
+					Value: &b,
+				}
+				affinityKVP = model.KVPair{
+					Key:   model.BlockAffinityKey{Host: hostA, CIDR: *net},
+					Value: &model.BlockAffinity{},
+				}
+
+				fc = newFakeClient()
+
+				// Sneak in a side-effect such that when hostA-proc1 tries to delete the block,
+				// it actually simulates the other process marking the affinity as pending
+				// and creating the block.
+				fc.deleteFuncs[fmt.Sprintf("%s", blockKVP.Key)] = func(ctx context.Context, key model.Key, revision string) (*model.KVPair, error) {
+					// Mark the affinity pending.
+					affinityKVP.Value.(*model.BlockAffinity).State = model.StatePending
+					_, err := bc.Apply(ctx, &affinityKVP)
+					if err != nil {
+						panic(err)
+					}
+
+					// Delete the block, but then immediately create it again to simulate another process claiming
+					// the block.
+					kvp, err := bc.Delete(ctx, key, revision)
+					bc.Create(ctx, kvp)
+					return kvp, err
+				}
+
+				// For any other objects, just create/update/delete them as normal.
+				fc.createFuncs["default"] = func(ctx context.Context, object *model.KVPair) (*model.KVPair, error) { return bc.Create(ctx, object) }
+				fc.updateFuncs["default"] = func(ctx context.Context, object *model.KVPair) (*model.KVPair, error) { return bc.Update(ctx, object) }
+				fc.deleteFuncs["default"] = func(ctx context.Context, k model.Key, r string) (*model.KVPair, error) { return bc.Delete(ctx, k, r) }
+				fc.getFuncs["default"] = func(ctx context.Context, k model.Key, r string) (*model.KVPair, error) { return bc.Get(ctx, k, r) }
+
+				rw = blockReaderWriter{client: fc, pools: pools}
+				ic = &ipamClient{
+					client:            bc,
+					pools:             pools,
+					blockReaderWriter: rw,
+				}
+			})
+
+			By("creating the affinity and block", func() {
+				_, err := bc.Create(ctx, &affinityKVP)
+				Expect(err).To(BeNil())
+
+				_, err = bc.Create(ctx, &blockKVP)
+				Expect(err).To(BeNil())
+			})
+
+			By("attempting to release the block", func() {
+				err := rw.releaseBlockAffinity(ctx, hostA, *net)
+				Expect(err).NotTo(BeNil())
+
+				// Should hit a resource update conflict.
+				_, ok := err.(cerrors.ErrorResourceUpdateConflict)
+				Expect(ok).To(BeTrue())
+			})
+		})
+
+		It("should support multiple async block affinity claims on the same block", func() {
+			affStrA := fmt.Sprintf("host:%s", hostA)
+			affStrB := fmt.Sprintf("host:%s", hostB)
 
 			// Configure a fake client such that we successfully create the
 			// block affininty, but fail to create the actual block.
@@ -139,11 +315,11 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 			// Creation function for a block affinity - actually create it.
 			affKVP := &model.KVPair{
-				Key:   model.BlockAffinityKey{Host: host, CIDR: *net},
+				Key:   model.BlockAffinityKey{Host: hostA, CIDR: *net},
 				Value: model.BlockAffinity{},
 			}
 			affKVP2 := &model.KVPair{
-				Key:   model.BlockAffinityKey{Host: otherHost, CIDR: *net},
+				Key:   model.BlockAffinityKey{Host: hostB, CIDR: *net},
 				Value: model.BlockAffinity{},
 			}
 
@@ -160,10 +336,8 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 			// Creation function for the actual block - should return an error indicating the block
 			// was already taken by another host.
-			aff := fmt.Sprintf("host:%s", host)
-			aff2 := "host:another-host"
 			b := newBlock(*net)
-			b.Affinity = &aff
+			b.Affinity = &affStrA
 			b.StrictAffinity = false
 			blockKVP := &model.KVPair{
 				Key:   model.BlockKey{*net},
@@ -171,7 +345,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 			}
 
 			b2 := newBlock(*net)
-			b2.Affinity = &aff2
+			b2.Affinity = &affStrB
 			b2.StrictAffinity = false
 			blockKVP2 := &model.KVPair{
 				Key:   model.BlockKey{*net},
@@ -230,17 +404,15 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 			}
 
 			// Create the block reader / writer which will simulate the failure scenario.
-			pools := &ipPoolAccessor{pools: map[string]bool{}}
-			pools.pools["10.0.0.0/26"] = true
-			rw := blockReaderWriter{client: fc, pools: pools}
-			ipamClient := &ipamClient{
+			rw = blockReaderWriter{client: fc, pools: pools}
+			ic = &ipamClient{
 				client:            bc,
 				pools:             pools,
 				blockReaderWriter: rw,
 			}
 
 			By("attempting to claim the block on multiple hosts at the same time", func() {
-				ips, err := ipamClient.autoAssign(ctx, 1, nil, nil, nil, ipv4, host)
+				ips, err := ic.autoAssign(ctx, 1, nil, nil, nil, ipv4, hostA)
 
 				// Shouldn't return an error.
 				Expect(err).NotTo(HaveOccurred())
@@ -251,7 +423,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 			By("checking that the other host has the affinity", func() {
 				// The block should have the affinity field set properly.
-				opts := model.BlockAffinityListOptions{Host: otherHost}
+				opts := model.BlockAffinityListOptions{Host: hostB}
 				objs, err := rw.client.List(ctx, opts, "")
 				Expect(err).NotTo(HaveOccurred())
 
@@ -262,7 +434,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 			By("checking that the test host has a pending affinity", func() {
 				// The block should have the affinity field set properly.
-				opts := model.BlockAffinityListOptions{Host: host}
+				opts := model.BlockAffinityListOptions{Host: hostA}
 				objs, err := rw.client.List(ctx, opts, "")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(len(objs.KVPairs)).To(Equal(1))
@@ -270,7 +442,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 			})
 
 			By("attempting to claim another address", func() {
-				ips, err := ipamClient.autoAssign(ctx, 1, nil, nil, nil, ipv4, host)
+				ips, err := ic.autoAssign(ctx, 1, nil, nil, nil, ipv4, hostA)
 
 				// Shouldn't return an error.
 				Expect(err).NotTo(HaveOccurred())
@@ -281,12 +453,101 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 			By("checking that the pending affinity was cleaned up", func() {
 				// The block should have the affinity field set properly.
-				opts := model.BlockAffinityListOptions{Host: host}
+				opts := model.BlockAffinityListOptions{Host: hostA}
 				objs, err := rw.client.List(ctx, opts, "")
 				Expect(err).NotTo(HaveOccurred())
 
 				// Should be a single block affinity, assigned to the other host.
 				Expect(len(objs.KVPairs)).To(Equal(0))
+			})
+		})
+	})
+
+	Context("test claiming / releasing affinities", func() {
+
+		var (
+			rw   blockReaderWriter
+			p    *ipPoolAccessor
+			bc   api.Client
+			ctx  context.Context
+			host string
+			net  *cnet.IPNet
+		)
+
+		BeforeEach(func() {
+			var err error
+
+			// Make the client and clean the data store.
+			bc, err = backend.NewClient(config)
+			Expect(err).NotTo(HaveOccurred())
+			bc.Clean()
+
+			// Create a fake client which we can use to simulate data store
+			// error situations.
+			// fc := newFakeClient()
+
+			// Configure a BRW with a real datastore client.
+			rw = blockReaderWriter{
+				client: bc,
+				pools:  p,
+			}
+			p = &ipPoolAccessor{pools: map[string]bool{}}
+			ctx = context.Background()
+
+			_, net, err = cnet.ParseCIDR("10.1.0.0/26")
+			Expect(err).NotTo(HaveOccurred())
+
+			host = "test-hostname"
+		})
+
+		It("should claim and release a block affinity", func() {
+			By("claiming an affinity for a host", func() {
+				config := IPAMConfig{}
+				err := rw.claimBlockAffinity(ctx, *net, host, config)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("claiming the existing affinity again", func() {
+				config := IPAMConfig{}
+				err := rw.claimBlockAffinity(ctx, *net, host, config)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("checking the affinity exists", func() {
+				k := model.BlockAffinityKey{Host: host, CIDR: *net}
+				aff, err := bc.Get(ctx, k, "")
+				Expect(err).NotTo(HaveOccurred())
+				Expect(aff.Value.(*model.BlockAffinity).State).To(Equal(model.StateConfirmed))
+			})
+
+			By("checking the block exists", func() {
+				k := model.BlockKey{CIDR: *net}
+				_, err := bc.Get(ctx, k, "")
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("releasing the affinity", func() {
+				err := rw.releaseBlockAffinity(ctx, host, *net)
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("checking the affinity no longer exists", func() {
+				k := model.BlockAffinityKey{Host: host, CIDR: *net}
+				_, err := bc.Get(ctx, k, "")
+				Expect(err).To(HaveOccurred())
+			})
+
+			By("checking the block no longer exists", func() {
+				k := model.BlockKey{CIDR: *net}
+				_, err := bc.Get(ctx, k, "")
+				Expect(err).To(HaveOccurred())
+			})
+
+			By("releasing the affinity again", func() {
+				err := rw.releaseBlockAffinity(ctx, host, *net)
+				Expect(err).To(HaveOccurred())
+				_, ok := err.(cerrors.ErrorResourceDoesNotExist)
+				Expect(ok).To(BeTrue())
 			})
 		})
 	})
