@@ -103,6 +103,80 @@ func (c ipamClient) AutoAssign(ctx context.Context, args AutoAssignArgs) ([]net.
 	return v4list, v6list, nil
 }
 
+// getBlockFromAffinity returns the block referenced by the given affinity, attempting to create it if
+// it does not exist. getBlockFromAffinity will delete the provided affinity if it does not match the actual
+// affinity of the block.
+func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair) (*model.KVPair, error) {
+	// Parse out affinity data.
+	cidr := aff.Key.(model.BlockAffinityKey).CIDR
+	host := aff.Key.(model.BlockAffinityKey).Host
+	state := aff.Value.(*model.BlockAffinity).State
+
+	// Get the block referenced by this affinity.
+	b, err := c.client.Get(ctx, model.BlockKey{CIDR: cidr}, "")
+	if err != nil {
+		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
+			// The block referenced by the affinity doesn't exist. Try to create it.
+			aff.Value.(*model.BlockAffinity).State = model.StatePending
+			aff, err = c.client.Update(ctx, aff)
+			if err != nil {
+				return nil, err
+			}
+
+			cfg, err := c.GetIPAMConfig(ctx)
+			if err != nil {
+				log.Errorf("Error getting IPAM Config: %v", err)
+				return nil, err
+			}
+
+			// Claim the block, which will also confirm the affinity.
+			b, err := c.blockReaderWriter.claimBlockAffinity(ctx, aff, *cfg)
+			if err != nil {
+				return nil, err
+			}
+			return b, nil
+		}
+		return nil, err
+	}
+
+	// If the block doesn't match the affinity, it means we've got a stale affininty hanging around.
+	// We should remove it.
+	blockAffinity := b.Value.(*model.AllocationBlock).Affinity
+	if blockAffinity == nil || *blockAffinity != fmt.Sprintf("host:%s", host) {
+		log.Warn("Block does not match the provided affinity, deleting stale affinity")
+		_, err := c.client.Delete(ctx, aff.Key, aff.Revision)
+		if err != nil {
+			return nil, err
+		}
+		return nil, errors.New("Affinity is stale")
+	}
+
+	// Otherwise, if the block does match the affinity but the affinity has not been confirmed,
+	// try to confirm it.
+	if state != model.StateConfirmed {
+		// Write the affinity as pending.
+		aff.Value.(*model.BlockAffinity).State = model.StatePending
+		if err != nil {
+			return nil, err
+		}
+
+		// CAS the block to get a new revision and invalidate any other instances
+		// that might be trying to operate on the block.
+		b, err = c.client.Update(ctx, b)
+		if err != nil {
+			return nil, err
+		}
+
+		// Confirm the affinity.
+		aff.Value.(*model.BlockAffinity).State = model.StateConfirmed
+		aff, err = c.client.Update(ctx, aff)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return b, nil
+}
+
 func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, attrs map[string]string, pools []net.IPNet, version ipVersion, host string) ([]net.IP, error) {
 
 	// Start by trying to assign from one of the host-affine blocks.  We
@@ -115,6 +189,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 	}
 	log.Debugf("Found %d affine IPv%d blocks for host '%s': %v", len(affBlocks), version.Number, host, affBlocks)
 	ips := []net.IP{}
+	newIPs := []net.IP{}
 	for len(ips) < num {
 		if len(affBlocks) == 0 {
 			log.Infof("Ran out of existing affine blocks for host '%s'", host)
@@ -123,14 +198,42 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 		cidr := affBlocks[0]
 		affBlocks = affBlocks[1:]
 
-		// Only allocate from this existing block if the host->block affinity has been confirmed.
-		if c.verifyAffinity(ctx, host, cidr) {
-			ips, err = c.assignFromExistingBlock(ctx, cidr, num, handleID, attrs, host, true)
+		// Try to assign from this block - if we hit a CAS error, we'll try again.
+		for i := 0; i < ipamEtcdRetries; i++ {
+			// Get the affinity.
+			aff, err := c.client.Get(ctx, model.BlockAffinityKey{Host: host, CIDR: cidr}, "")
+			if err != nil {
+				log.WithError(err).Warnf("Error getting affinity")
+				break
+			}
+
+			// Get the block which is referenced by the affinity, creating it if necessary.
+			b, err := c.getBlockFromAffinity(ctx, aff)
+			if err != nil {
+				// Couldn't get a block for this affinity.
+				log.WithError(err).Warn("Couldn't get block for affinity")
+				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+					// CAS Error - retry.
+					continue
+				}
+				break
+			}
+
+			// Assign IPs from the block.
+			log.Info("Assigning from existing affine block")
+			newIPs, err = c.assignFromExistingBlock(ctx, b, num, handleID, attrs, host, true)
 			if err != nil {
 				log.WithError(err).Info("Couldn't assign from existing block")
+				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); !ok {
+					// CAS Error - retry.
+					continue
+				}
+				break
 			}
+			ips = append(ips, newIPs...)
+			break
 		}
-		log.Debugf("Block '%s' provided addresses: %v", cidr.String(), ips)
+		log.Debugf("Block '%s' provided addresses: %v", cidr.String(), newIPs)
 	}
 
 	// If there are still addresses to allocate, then we've run out of
@@ -154,6 +257,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 				// Error claiming new block.
 				if _, ok := err.(noFreeBlocksError); ok {
 					// No free blocks.  Break.
+					log.Info("No free blocks available for allocation")
 					break
 				} else if _, ok := err.(errBlockClaimConflict); ok {
 					// We conflicted with another host - retry.
@@ -163,15 +267,26 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 				return nil, err
 			} else {
 				// Claim successful.  Assign addresses from the new block.
-				log.Infof("Claimed new block %s - assigning %d addresses", b.String(), rem)
-				newIPs, err := c.assignFromExistingBlock(ctx, *b, rem, handleID, attrs, host, config.StrictAffinity)
-				if err != nil {
-					log.Warningf("Failed to assign IPs:", err)
+				log.Infof("Claimed new block %v - assigning %d addresses", b, rem)
+				for i := 0; i < ipamEtcdRetries; i++ {
+					newIPs, err := c.assignFromExistingBlock(ctx, b, rem, handleID, attrs, host, config.StrictAffinity)
+					if err != nil {
+						if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+							// CAS error allocating from block - retry.
+							b, err = c.client.Get(ctx, b.Key, "")
+							if err != nil {
+								return nil, err
+							}
+							continue
+						}
+						log.Warningf("Failed to assign IPs:", err)
+						return nil, err
+					}
+					log.Debugf("Assigned IPs from new block: %s", newIPs)
+					ips = append(ips, newIPs...)
+					rem = num - len(ips)
 					break
 				}
-				log.Debugf("Assigned IPs from new block: %s", newIPs)
-				ips = append(ips, newIPs...)
-				rem = num - len(ips)
 			}
 		}
 
@@ -220,14 +335,27 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 					break
 				}
 
-				// Attempt to assign from the block.
-				newIPs, err := c.assignFromExistingBlock(ctx, *blockCIDR, rem, handleID, attrs, host, false)
-				if err != nil {
-					log.Warningf("Failed to assign IPs in pool %s: %v", p.String(), err)
+				for i := 0; i < ipamEtcdRetries; i++ {
+					b, err := c.client.Get(ctx, model.BlockKey{CIDR: *blockCIDR}, "")
+					if err != nil {
+						log.WithError(err).Warn("Failed to get block")
+						break
+					}
+
+					// Attempt to assign from the block.
+					newIPs, err := c.assignFromExistingBlock(ctx, b, rem, handleID, attrs, host, false)
+					if err != nil {
+						if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+							// CAS error - retry.
+							continue
+						}
+						log.Warningf("Failed to assign IPs in pool %s: %v", p.String(), err)
+						break
+					}
+					ips = append(ips, newIPs...)
+					rem = num - len(ips)
 					break
 				}
-				ips = append(ips, newIPs...)
-				rem = num - len(ips)
 			}
 		}
 	}
@@ -271,7 +399,15 @@ func (c ipamClient) AssignIP(ctx context.Context, args AssignIPArgs) error {
 					log.Errorf("Error getting IPAM Config: %v", err)
 					return err
 				}
-				err = c.blockReaderWriter.claimBlockAffinity(ctx, blockCIDR, hostname, *cfg)
+				pa, err := c.blockReaderWriter.getPendingAffinity(ctx, hostname, blockCIDR)
+				if err != nil {
+					if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+						// Conflict claiming affinity. Retry.
+						continue
+					}
+					return err
+				}
+				_, err = c.blockReaderWriter.claimBlockAffinity(ctx, pa, *cfg)
 				if err != nil {
 					if _, ok := err.(*errBlockClaimConflict); ok {
 						log.Warningf("Someone else claimed block %s before us", blockCIDR.String())
@@ -414,105 +550,41 @@ func (c ipamClient) releaseIPsFromBlock(ctx context.Context, ips []net.IP, block
 	return nil, errors.New("Max retries hit - excessive concurrent IPAM requests")
 }
 
-// verifyAffinity verifies that the given block has a confirmed affinity for the given host, returning
-// true if confirmed and false otherwise. verifyAffinity will attempt to reconcile the affinity if it
-// exists but is pending.
-func (c ipamClient) verifyAffinity(ctx context.Context, host string, blockCIDR net.IPNet) bool {
-	// Lookup the affinity for this host / block.
-	log.Infof("Verifying block %s has affinity for host %s", blockCIDR, host)
-	k := model.BlockAffinityKey{Host: host, CIDR: blockCIDR}
-	aff, err := c.client.Get(ctx, k, "")
-	if err != nil {
-		log.WithError(err).Error("Failed to lookup block affinity")
-		return false
-	}
-
-	// If it exists, check that the affinity is not pending. If pending and no block exists,
-	// try to claim the affinity for ourselves. If the block already belongs to another host,
-	// clean up the affinity to this host and return.
-	if aff.Value.(*model.BlockAffinity).State == model.StatePending {
-		// Try to claim the block. The call to `claimBlockAffinity` will do the following:
-		// - If the block doesn't yet exist, it will attempt to claim it for ourselves.
-		// - If the block does exist but is already affine to this host, then the affinity will be confirmed.
-		// - If the block exists but is affine to another host, the pending affinity will be cleaned up.
-		for i := 0; i < ipamEtcdRetries; i++ {
-			log.Info("Affinity is pending - attempt to confirm")
-			cfg, err := c.GetIPAMConfig(ctx)
-			if err != nil {
-				log.WithError(err).Errorf("Failed to get IPAM Config")
-				return false
-			}
-			if err := c.blockReaderWriter.claimBlockAffinity(ctx, blockCIDR, host, *cfg); err != nil {
-				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-					// We hit an update conflict trying to confirm the affinity - this could mean
-					// another process on this host has confirmed the affinity, or that the affinity
-					// has been deleted while we were trying to confirm it.
-					// CD: If it's deleted, do we want to retry here?
-					continue
-				}
-				log.Info("Failed to claim pending affinity")
-				return false
-			}
-		}
-
-		// We successfully claimed the pending block.
-		log.Info("Successfully claimed pending block")
-		return true
-	} else if aff.Value.(*model.BlockAffinity).State == model.StatePendingDeletion {
-		// Affinity is pending deletion and so is not valid for allocations.
-		log.Info("Affinity is pending deletion")
-		return false
-	}
-
-	// If not pending, return successfully.
-	return true
-}
-
-func (c ipamClient) assignFromExistingBlock(
-	ctx context.Context, blockCIDR net.IPNet, num int, handleID *string,
-	attrs map[string]string, host string, affCheck bool,
-) ([]net.IP, error) {
-	// Limit number of retries.
+func (c ipamClient) assignFromExistingBlock(ctx context.Context, block *model.KVPair, num int, handleID *string, attrs map[string]string, host string, affCheck bool) ([]net.IP, error) {
 	var ips []net.IP
-	for i := 0; i < ipamEtcdRetries; i++ {
-		log.Debugf("Auto-assign from %s - retry %d", blockCIDR.String(), i)
-		obj, err := c.client.Get(ctx, model.BlockKey{blockCIDR}, "")
-		if err != nil {
-			log.Errorf("Error getting block: %v", err)
-			return nil, err
-		}
+	blockCIDR := block.Key.(model.BlockKey).CIDR
+	log.Debugf("Auto-assign from %s", blockCIDR.String())
 
-		// Pull out the block.
-		b := allocationBlock{obj.Value.(*model.AllocationBlock)}
+	// Pull out the block.
+	b := allocationBlock{block.Value.(*model.AllocationBlock)}
 
-		log.Debugf("Got block: %+v", b)
-		ips, err = b.autoAssign(num, handleID, host, attrs, affCheck)
-		if err != nil {
-			log.Errorf("Error in auto assign: %v", err)
-			return nil, err
-		}
-		if len(ips) == 0 {
-			log.Infof("Block %s is full", blockCIDR)
-			return []net.IP{}, nil
-		}
+	log.Debugf("Got block: %+v", b)
+	var err error
+	ips, err = b.autoAssign(num, handleID, host, attrs, affCheck)
+	if err != nil {
+		log.Errorf("Error in auto assign: %v", err)
+		return nil, err
+	}
+	if len(ips) == 0 {
+		log.Infof("Block %s is full", blockCIDR)
+		return []net.IP{}, nil
+	}
 
-		// Increment handle count.
+	// Increment handle count.
+	if handleID != nil {
+		c.incrementHandle(ctx, *handleID, blockCIDR, num)
+	}
+
+	// Update the block using CAS by passing back the original
+	// KVPair.
+	block.Value = b.AllocationBlock
+	_, err = c.client.Update(ctx, block)
+	if err != nil {
+		log.Infof("Failed to update block '%s' - try again", b.CIDR.String())
 		if handleID != nil {
-			c.incrementHandle(ctx, *handleID, blockCIDR, num)
+			c.decrementHandle(ctx, *handleID, blockCIDR, num)
 		}
-
-		// Update the block using CAS by passing back the original
-		// KVPair.
-		obj.Value = b.AllocationBlock
-		_, err = c.client.Update(ctx, obj)
-		if err != nil {
-			log.Infof("Failed to update block '%s' - try again", b.CIDR.String())
-			if handleID != nil {
-				c.decrementHandle(ctx, *handleID, blockCIDR, num)
-			}
-			continue
-		}
-		break
+		return nil, err
 	}
 	return ips, nil
 }
@@ -553,7 +625,15 @@ func (c ipamClient) ClaimAffinity(ctx context.Context, cidr net.IPNet, host stri
 	// Claim all blocks within the given cidr.
 	blocks := blockGenerator(cidr)
 	for blockCIDR := blocks(); blockCIDR != nil; blockCIDR = blocks() {
-		err := c.blockReaderWriter.claimBlockAffinity(ctx, *blockCIDR, hostname, *cfg)
+		// First, claim a pending affinity.
+		pa, err := c.blockReaderWriter.getPendingAffinity(ctx, hostname, *blockCIDR)
+		if err != nil {
+			// CD: TODO
+			return claimed, failed, err
+		}
+
+		// Once we have the affinity, claim the block, which will confirm the affinity.
+		_, err = c.blockReaderWriter.claimBlockAffinity(ctx, pa, *cfg)
 		if err != nil {
 			if _, ok := err.(errBlockClaimConflict); ok {
 				// Claimed by someone else - add to failed list.

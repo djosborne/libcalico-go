@@ -211,8 +211,11 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 			})
 
 			By("attempting to claim the block", func() {
+				pa, err := rw.getPendingAffinity(ctx, hostA, *net)
+				Expect(err).NotTo(HaveOccurred())
+
 				config := IPAMConfig{}
-				err := rw.claimBlockAffinity(ctx, *net, hostA, config)
+				_, err = rw.claimBlockAffinity(ctx, pa, config)
 				Expect(err).NotTo(BeNil())
 
 				// Should hit a resource update conflict.
@@ -502,14 +505,20 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 		It("should claim and release a block affinity", func() {
 			By("claiming an affinity for a host", func() {
+				pa, err := rw.getPendingAffinity(ctx, host, *net)
+				Expect(err).NotTo(HaveOccurred())
+
 				config := IPAMConfig{}
-				err := rw.claimBlockAffinity(ctx, *net, host, config)
+				_, err = rw.claimBlockAffinity(ctx, pa, config)
 				Expect(err).NotTo(HaveOccurred())
 			})
 
 			By("claiming the existing affinity again", func() {
+				pa, err := rw.getPendingAffinity(ctx, host, *net)
+				Expect(err).NotTo(HaveOccurred())
+
 				config := IPAMConfig{}
-				err := rw.claimBlockAffinity(ctx, *net, host, config)
+				_, err = rw.claimBlockAffinity(ctx, pa, config)
 				Expect(err).NotTo(HaveOccurred())
 			})
 
