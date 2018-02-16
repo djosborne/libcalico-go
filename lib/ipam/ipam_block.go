@@ -82,6 +82,9 @@ func (b *allocationBlock) autoAssign(
 		// Affinity check is enabled but the host does not match - error.
 		s := fmt.Sprintf("Block affinity (%s) does not match provided (%s)", *b.Affinity, host)
 		return nil, errors.New(s)
+	} else if b.Affinity == nil {
+		// Should never assign from a block with no affinity.
+		return nil, fmt.Errorf("Attempt to assign from block %v with no affinity", b.CIDR)
 	}
 
 	// Walk the allocations until we find enough addresses.
@@ -107,6 +110,9 @@ func (b *allocationBlock) assign(address cnet.IP, handleID *string, attrs map[st
 	if b.StrictAffinity && b.Affinity != nil && !hostAffinityMatches(host, b.AllocationBlock) {
 		// Affinity check is enabled but the host does not match - error.
 		return errors.New("Block host affinity does not match")
+	} else if b.Affinity == nil {
+		// Should never assign from a block with no affinity.
+		return fmt.Errorf("Attempt to assign from block %v with no affinity", b.CIDR)
 	}
 
 	// Convert to an ordinal.
