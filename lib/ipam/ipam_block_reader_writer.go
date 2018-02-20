@@ -74,6 +74,8 @@ func (rw blockReaderWriter) getAffineBlocks(ctx context.Context, host string, ve
 	return ids, nil
 }
 
+// claimNewAffineBlock claims a new pending affinity for a currently unclaimed allocation block. The calling code should use the pending affinity
+// to attempt to claim the actual allocation block.
 func (rw blockReaderWriter) claimNewAffineBlock(ctx context.Context, host string, version ipVersion, requestedPools []cnet.IPNet, config IPAMConfig) (*model.KVPair, error) {
 	// If requestedPools is not empty, use it.  Otherwise, default to all configured pools.
 	pools := []cnet.IPNet{}
@@ -131,27 +133,11 @@ func (rw blockReaderWriter) claimNewAffineBlock(ctx context.Context, host string
 				if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
 					// The block does not yet exist in etcd.  Try to grab it.
 					log.Infof("Found free block: %+v", *subnet)
-					for i := 0; i < ipamEtcdRetries; i++ {
-						pa, err := rw.getPendingAffinity(ctx, host, *subnet)
-						if err != nil {
-							if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-								log.Debug("Resource conflict error - retrying claim")
-								continue
-							}
-							log.WithError(err).Warnf("Failed to claim pending affinity")
-							return nil, err
-						}
-						b, err := rw.claimBlockAffinity(ctx, pa, config)
-						if err != nil {
-							if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-								log.Debug("Resource conflict error - retrying claim")
-								continue
-							}
-							log.WithError(err).Warnf("Failed to claim block")
-							return nil, err
-						}
-						return b, nil
+					pa, err := rw.getPendingAffinity(ctx, host, *subnet)
+					if err != nil {
+						return nil, err
 					}
+					return pa, nil
 				} else {
 					log.Errorf("Error getting block: %v", err)
 					return nil, err
@@ -182,12 +168,6 @@ func isPoolInRequestedPools(pool cnet.IPNet, requestedPools []cnet.IPNet) bool {
 // be used to claim a block. If an affinity already exists, it will attempt to mark the existing affinity
 // as pending.
 func (rw blockReaderWriter) getPendingAffinity(ctx context.Context, host string, subnet cnet.IPNet) (*model.KVPair, error) {
-	// Make sure hostname is not empty.
-	if host == "" {
-		log.Errorf("Hostname can't be empty")
-		return nil, errors.New("Hostname must be sepcified to claim block affinity")
-	}
-
 	log.Infof("Host %s claiming pending affinity for %s", host, subnet)
 	obj := model.KVPair{
 		Key:   model.BlockAffinityKey{Host: host, CIDR: subnet},
