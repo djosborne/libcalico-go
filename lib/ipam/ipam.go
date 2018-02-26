@@ -182,17 +182,18 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 	// Start by trying to assign from one of the host-affine blocks.  We
 	// always do strict checking at this stage, so it doesn't matter whether
 	// globally we have strict_affinity or not.
-	log.Debugf("Looking for addresses in current affine blocks for host '%s'", host)
+	logCtx := log.WithFields(log.Fields{"host": host})
+	logCtx.Debugf("Looking for addresses in current affine blocks for host")
 	affBlocks, err := c.blockReaderWriter.getAffineBlocks(ctx, host, version, pools)
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("Found %d affine IPv%d blocks for host '%s': %v", len(affBlocks), version.Number, host, affBlocks)
+	logCtx.Debugf("Found %d affine IPv%d blocks for host: %v", len(affBlocks), version.Number, affBlocks)
 	ips := []net.IP{}
 	newIPs := []net.IP{}
 	for len(ips) < num {
 		if len(affBlocks) == 0 {
-			log.Infof("Ran out of existing affine blocks for host '%s'", host)
+			logCtx.Infof("Ran out of existing affine blocks for host")
 			break
 		}
 		cidr := affBlocks[0]
@@ -204,7 +205,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 			// Get the affinity.
 			aff, err := c.client.Get(ctx, model.BlockAffinityKey{Host: host, CIDR: cidr}, "")
 			if err != nil {
-				log.WithError(err).Warnf("Error getting affinity")
+				logCtx.WithError(err).Warnf("Error getting affinity")
 				break
 			}
 
@@ -212,7 +213,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 			b, err := c.getBlockFromAffinity(ctx, aff)
 			if err != nil {
 				// Couldn't get a block for this affinity.
-				log.WithError(err).Warn("Couldn't get block for affinity")
+				logCtx.WithError(err).Warn("Couldn't get block for affinity")
 				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
 					// CAS Error - retry.
 					continue
@@ -221,10 +222,10 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 			}
 
 			// Assign IPs from the block.
-			log.Info("Assigning from existing affine block")
+			logCtx.Info("Assigning from existing affine block")
 			newIPs, err = c.assignFromExistingBlock(ctx, b, num, handleID, attrs, host, true)
 			if err != nil {
-				log.WithError(err).Info("Couldn't assign from existing block")
+				logCtx.WithError(err).Info("Couldn't assign from existing block")
 				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); !ok {
 					// CAS Error - retry.
 					continue
@@ -234,7 +235,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 			ips = append(ips, newIPs...)
 			break
 		}
-		log.Debugf("Block '%s' provided addresses: %v", cidr.String(), newIPs)
+		logCtx.Debugf("Block '%s' provided addresses: %v", cidr.String(), newIPs)
 	}
 
 	// If there are still addresses to allocate, then we've run out of
@@ -245,40 +246,41 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 	if err != nil {
 		return nil, err
 	}
-	log.Debugf("Allocate new blocks? Config: %+v", config)
+	logCtx.Debugf("Allocate new blocks? Config: %+v", config)
 	if config.AutoAllocateBlocks == true {
 		rem := num - len(ips)
 		retries := ipamEtcdRetries
 		for rem > 0 && retries > 0 {
 			// Claim a new block.
-			log.Infof("Need to allocate %d more addresses - allocate another block", rem)
+			logCtx.Infof("Need to allocate %d more addresses - allocate another block", rem)
 			retries = retries - 1
 			pa, err := c.blockReaderWriter.claimNewAffineBlock(ctx, host, version, pools, *config)
 			if err != nil {
 				// Error claiming new block.
 				if _, ok := err.(noFreeBlocksError); ok {
 					// No free blocks.  Break.
-					log.Info("No free blocks available for allocation")
+					logCtx.Info("No free blocks available for allocation")
 					break
 				} else if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-					log.Info("CAS error claiming new block - retry")
+					logCtx.Info("CAS error claiming new block - retry")
 					continue
 				}
 
 				// Some other error claiming an affinity - retry.
-				log.Errorf("Error claiming new block: %v", err)
+				logCtx.Errorf("Error claiming new block: %v", err)
 				return nil, err
 			}
+			logCtx.Debugf("Claimed pending affinity for %+v", pa.Value)
 
 			// We have a pending affinity - try to get the block.
 			b, err := c.getBlockFromAffinity(ctx, pa)
 			if err != nil {
-				log.WithError(err).Warning("Failed to get block")
+				logCtx.WithError(err).Warning("Failed to get newly claimed block")
 				continue
 			}
 
 			// Claim successful.  Assign addresses from the new block.
-			log.Infof("Claimed new block %v - assigning %d addresses", b, rem)
+			logCtx.Infof("Claimed new block %v - assigning %d addresses", b, rem)
 			for i := 0; i < ipamEtcdRetries; i++ {
 				newIPs, err := c.assignFromExistingBlock(ctx, b, rem, handleID, attrs, host, config.StrictAffinity)
 				if err != nil {
@@ -291,10 +293,10 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 						}
 						continue
 					}
-					log.Warningf("Failed to assign IPs:", err)
+					logCtx.Warningf("Failed to assign IPs:", err)
 					break
 				}
-				log.Debugf("Assigned IPs from new block: %s", newIPs)
+				logCtx.Debugf("Assigned IPs from new block: %s", newIPs)
 				ips = append(ips, newIPs...)
 				rem = num - len(ips)
 				break
@@ -322,13 +324,13 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 	// from those.
 	rem := num - len(ips)
 	if config.StrictAffinity != true && rem != 0 {
-		log.Infof("Attempting to assign %d more addresses from non-affine blocks", rem)
+		logCtx.Infof("Attempting to assign %d more addresses from non-affine blocks", rem)
 		// Figure out the pools to allocate from.
 		if len(pools) == 0 {
 			// Default to all configured pools.
 			pools, err = c.pools.GetEnabledPools(version.Number)
 			if err != nil {
-				log.Errorf("Error reading configured pools: %v", err)
+				logCtx.Errorf("Error reading configured pools: %v", err)
 				return ips, nil
 			}
 		}
@@ -336,20 +338,20 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 		// Iterate over pools and assign addresses until we either run out of pools,
 		// or the request has been satisfied.
 		for _, p := range pools {
-			log.Debugf("Assigning from random blocks in pool %s", p.String())
+			logCtx.Debugf("Assigning from random blocks in pool %s", p.String())
 			newBlock := randomBlockGenerator(p, host)
 			for rem > 0 {
 				// Grab a new random block.
 				blockCIDR := newBlock()
 				if blockCIDR == nil {
-					log.Warningf("All addresses exhausted in pool %s", p.String())
+					logCtx.Warningf("All addresses exhausted in pool %s", p.String())
 					break
 				}
 
 				for i := 0; i < ipamEtcdRetries; i++ {
 					b, err := c.client.Get(ctx, model.BlockKey{CIDR: *blockCIDR}, "")
 					if err != nil {
-						log.WithError(err).Warn("Failed to get block")
+						logCtx.WithError(err).Warn("Failed to get non-affine block")
 						break
 					}
 
@@ -360,7 +362,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 							// CAS error - retry.
 							continue
 						}
-						log.Warningf("Failed to assign IPs in pool %s: %v", p.String(), err)
+						logCtx.Warningf("Failed to assign IPs in pool %s: %v", p.String(), err)
 						break
 					}
 					ips = append(ips, newIPs...)
@@ -371,7 +373,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 		}
 	}
 
-	log.Infof("Auto-assigned %d out of %d IPv%ds: %v", len(ips), num, version.Number, ips)
+	logCtx.Infof("Auto-assigned %d out of %d IPv%ds: %v", len(ips), num, version.Number, ips)
 	return ips, nil
 }
 
@@ -564,20 +566,21 @@ func (c ipamClient) releaseIPsFromBlock(ctx context.Context, ips []net.IP, block
 func (c ipamClient) assignFromExistingBlock(ctx context.Context, block *model.KVPair, num int, handleID *string, attrs map[string]string, host string, affCheck bool) ([]net.IP, error) {
 	var ips []net.IP
 	blockCIDR := block.Key.(model.BlockKey).CIDR
-	log.Debugf("Auto-assign from %s", blockCIDR.String())
+	logCtx := log.WithFields(log.Fields{"host": host})
+	logCtx.Debugf("Auto-assign from %s", blockCIDR.String())
 
 	// Pull out the block.
 	b := allocationBlock{block.Value.(*model.AllocationBlock)}
 
-	log.Debugf("Got block: %+v", b)
+	logCtx.Debugf("Got block: %+v", b)
 	var err error
 	ips, err = b.autoAssign(num, handleID, host, attrs, affCheck)
 	if err != nil {
-		log.Errorf("Error in auto assign: %v", err)
+		logCtx.Errorf("Error in auto assign: %v", err)
 		return nil, err
 	}
 	if len(ips) == 0 {
-		log.Infof("Block %s is full", blockCIDR)
+		logCtx.Infof("Block %s is full", blockCIDR)
 		return []net.IP{}, nil
 	}
 
@@ -591,7 +594,7 @@ func (c ipamClient) assignFromExistingBlock(ctx context.Context, block *model.KV
 	block.Value = b.AllocationBlock
 	_, err = c.client.Update(ctx, block)
 	if err != nil {
-		log.Infof("Failed to update block '%s' - try again", b.CIDR.String())
+		logCtx.WithError(err).Infof("Failed to update block '%s' - try again", b.CIDR.String())
 		if handleID != nil {
 			c.decrementHandle(ctx, *handleID, blockCIDR, num)
 		}

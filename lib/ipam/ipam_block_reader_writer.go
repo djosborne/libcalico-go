@@ -123,6 +123,7 @@ func (rw blockReaderWriter) claimNewAffineBlock(ctx context.Context, host string
 	for _, pool := range pools {
 		// Use a block generator to iterate through all of the blocks
 		// that fall within the pool.
+		log.Debugf("Looking for blocks in pool %+v", pool)
 		blocks := randomBlockGenerator(pool, host)
 		for subnet := blocks(); subnet != nil; subnet = blocks() {
 			// Check if a block already exists for this subnet.
@@ -138,11 +139,11 @@ func (rw blockReaderWriter) claimNewAffineBlock(ctx context.Context, host string
 						return nil, err
 					}
 					return pa, nil
-				} else {
-					log.Errorf("Error getting block: %v", err)
-					return nil, err
 				}
+				log.Errorf("Error getting block: %v", err)
+				return nil, err
 			}
+			log.Debugf("Block %s already exists", subnet.String())
 		}
 	}
 	return nil, noFreeBlocksError("No Free Blocks")

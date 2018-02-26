@@ -17,6 +17,7 @@ package ipam
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -158,6 +159,123 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 			_, net, err = cnet.ParseCIDR("10.0.0.0/26")
 			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should handle multiple racing block affinity claims from different hosts", func() {
+			By("setting up the client for the test", func() {
+				// Pool has room for 16 blocks.
+				pls := &ipPoolAccessor{pools: map[string]bool{"10.0.0.0/22": true}}
+				rw = blockReaderWriter{client: bc, pools: pls}
+				ic = &ipamClient{
+					client:            bc,
+					pools:             pls,
+					blockReaderWriter: rw,
+				}
+			})
+
+			By("assigning from host twice the number of available blocks all at once", func() {
+				wg := sync.WaitGroup{}
+				var testErr error
+
+				for i := 0; i < 32; i++ {
+					wg.Add(1)
+					j := i
+					go func() {
+						testhost := fmt.Sprintf("host-%d", j)
+						ips, err := ic.autoAssign(ctx, 1, nil, nil, nil, ipv4, testhost)
+						if err != nil {
+							testErr = err
+						}
+						if len(ips) != 1 {
+							// All hosts should get an IP, although some will be from non-affine blocks.
+							testErr = fmt.Errorf("No IPs assigned to %s", testhost)
+						}
+
+						wg.Done()
+					}()
+				}
+
+				// Wait for allocations to finish, then assert success.
+				wg.Wait()
+				Expect(testErr).NotTo(HaveOccurred())
+			})
+
+			By("correctly allocating affinities", func() {
+				affs, err := bc.List(ctx, model.BlockAffinityListOptions{}, "")
+				Expect(err).NotTo(HaveOccurred())
+
+				// Each block in the IP pool should have exactly one corresponding affinity.
+				Expect(len(affs.KVPairs)).To(Equal(16))
+
+				// For each affinity, expect the corresponding block to have the same affinity.
+				for _, a := range affs.KVPairs {
+					log.Infof("Validaing affinity: %+v", a)
+					b, err := bc.Get(ctx, model.BlockKey{CIDR: a.Key.(model.BlockAffinityKey).CIDR}, "")
+					Expect(err).NotTo(HaveOccurred())
+					Expect(*b.Value.(*model.AllocationBlock).Affinity).To(Equal(fmt.Sprintf("host:%s", a.Key.(model.BlockAffinityKey).Host)))
+
+					// Each affinity should be confirmed.
+					Expect(a.Value.(*model.BlockAffinity).State).To(Equal(model.StateConfirmed))
+				}
+			})
+		})
+
+		It("should handle multiple racing block affinity claims from the same host", func() {
+			By("setting up the client for the test", func() {
+				// Pool has room for 16 blocks.
+				pls := &ipPoolAccessor{pools: map[string]bool{"10.0.0.0/25": true}}
+				rw = blockReaderWriter{client: bc, pools: pls}
+				ic = &ipamClient{
+					client:            bc,
+					pools:             pls,
+					blockReaderWriter: rw,
+				}
+			})
+
+			By("assigning from host twice the number of available blocks all at once", func() {
+				wg := sync.WaitGroup{}
+				var testErr error
+
+				for i := 0; i < 4; i++ {
+					wg.Add(1)
+					go func() {
+						testhost := "single-host"
+						ips, err := ic.autoAssign(ctx, 1, nil, nil, nil, ipv4, testhost)
+						if err != nil {
+							testErr = err
+						}
+						if len(ips) != 1 {
+							// All hosts should get an IP, although some will be from non-affine blocks.
+							testErr = fmt.Errorf("No IPs assigned to %s", testhost)
+						}
+
+						wg.Done()
+					}()
+				}
+
+				// Wait for allocations to finish, then assert success.
+				wg.Wait()
+				Expect(testErr).NotTo(HaveOccurred())
+			})
+
+			By("correctly allocating affinities", func() {
+				affs, err := bc.List(ctx, model.BlockAffinityListOptions{}, "")
+				Expect(err).NotTo(HaveOccurred())
+
+				// Should only have a single affinity, for the test host.
+				Expect(len(affs.KVPairs)).To(Equal(1))
+
+				// For each affinity, expect the corresponding block to have the same affinity.
+				for _, a := range affs.KVPairs {
+					log.Infof("Validaing affinity: %+v", a)
+					b, err := bc.Get(ctx, model.BlockKey{CIDR: a.Key.(model.BlockAffinityKey).CIDR}, "")
+					Expect(err).NotTo(HaveOccurred())
+					Expect(*b.Value.(*model.AllocationBlock).Affinity).To(Equal(fmt.Sprintf("host:%s", a.Key.(model.BlockAffinityKey).Host)))
+
+					// Each affinity should be confirmed.
+					Expect(a.Value.(*model.BlockAffinity).State).To(Equal(model.StateConfirmed))
+				}
+			})
 		})
 
 		It("should handle releasing an affinity while another claim has created the block", func() {
