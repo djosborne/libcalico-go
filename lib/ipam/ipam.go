@@ -317,7 +317,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 						log.WithError(err).Debug("CAS Error assigning from new block - retry")
 						continue
 					}
-					logCtx.WithError(err).Warningf("Failed to assign IPs")
+					logCtx.WithError(err).Warningf("Failed to assign IPs in newly allocated block")
 					break
 				}
 				logCtx.Debugf("Assigned IPs from new block: %s", newIPs)
@@ -386,7 +386,7 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 							logCtx.WithError(err).Debug("CAS error assigning from non-affine block - retry")
 							continue
 						}
-						logCtx.WithError(err).Warningf("Failed to assign IPs in pool %s", p.String())
+						logCtx.WithError(err).Warningf("Failed to assign IPs from non-affine block in pool %s", p.String())
 						break
 					}
 					ips = append(ips, newIPs...)
@@ -601,8 +601,8 @@ func (c ipamClient) releaseIPsFromBlock(ctx context.Context, ips []net.IP, block
 func (c ipamClient) assignFromExistingBlock(ctx context.Context, block *model.KVPair, num int, handleID *string, attrs map[string]string, host string, affCheck bool) ([]net.IP, error) {
 	var ips []net.IP
 	blockCIDR := block.Key.(model.BlockKey).CIDR
-	logCtx := log.WithFields(log.Fields{"host": host})
-	logCtx.Debugf("Auto-assign from %s", blockCIDR.String())
+	logCtx := log.WithFields(log.Fields{"host": host, "handle": handleID, "block": blockCIDR})
+	logCtx.Debugf("Attempting to assign %d addresses from block", num)
 
 	// Pull out the block.
 	b := allocationBlock{block.Value.(*model.AllocationBlock)}
@@ -611,11 +611,11 @@ func (c ipamClient) assignFromExistingBlock(ctx context.Context, block *model.KV
 	var err error
 	ips, err = b.autoAssign(num, handleID, host, attrs, affCheck)
 	if err != nil {
-		logCtx.Errorf("Error in auto assign: %v", err)
+		logCtx.WithError(err).Errorf("Error in auto assign")
 		return nil, err
 	}
 	if len(ips) == 0 {
-		logCtx.Infof("Block %s is full", blockCIDR)
+		logCtx.Infof("Block is full")
 		return []net.IP{}, nil
 	}
 
@@ -629,7 +629,7 @@ func (c ipamClient) assignFromExistingBlock(ctx context.Context, block *model.KV
 	block.Value = b.AllocationBlock
 	_, err = c.client.Update(ctx, block)
 	if err != nil {
-		logCtx.WithError(err).Infof("Failed to update block '%s' - try again", b.CIDR.String())
+		logCtx.WithError(err).Infof("Failed to update block")
 		if handleID != nil {
 			c.decrementHandle(ctx, *handleID, blockCIDR, num)
 		}
@@ -644,6 +644,8 @@ func (c ipamClient) assignFromExistingBlock(ctx context.Context, block *model.KV
 // list of blocks that were claimed by another host.
 // If an empty string is passed as the host, then the hostname is automatically detected.
 func (c ipamClient) ClaimAffinity(ctx context.Context, cidr net.IPNet, host string) ([]net.IPNet, []net.IPNet, error) {
+	logCtx := log.WithFields(log.Fields{"host": host})
+
 	// Validate that the given CIDR is at least as big as a block.
 	if !largerThanOrEqualToBlock(cidr) {
 		estr := fmt.Sprintf("The requested CIDR (%s) is smaller than the minimum.", cidr.String())
@@ -667,32 +669,42 @@ func (c ipamClient) ClaimAffinity(ctx context.Context, cidr net.IPNet, host stri
 	// Get IPAM config.
 	cfg, err := c.GetIPAMConfig(ctx)
 	if err != nil {
-		log.Errorf("Failed to get IPAM Config: %v", err)
+		logCtx.Errorf("Failed to get IPAM Config: %v", err)
 		return nil, nil, err
 	}
 
 	// Claim all blocks within the given cidr.
 	blocks := blockGenerator(cidr)
 	for blockCIDR := blocks(); blockCIDR != nil; blockCIDR = blocks() {
-		// First, claim a pending affinity.
-		pa, err := c.blockReaderWriter.getPendingAffinity(ctx, hostname, *blockCIDR)
-		if err != nil {
-			// CD: TODO
-			return claimed, failed, err
-		}
-
-		// Once we have the affinity, claim the block, which will confirm the affinity.
-		_, err = c.blockReaderWriter.claimAffineBlock(ctx, pa, *cfg)
-		if err != nil {
-			if _, ok := err.(errBlockClaimConflict); ok {
-				// Claimed by someone else - add to failed list.
-				failed = append(failed, *blockCIDR)
-			} else {
-				log.Errorf("Failed to claim block: %v", err)
+		for i := 0; i < ipamEtcdRetries; i++ {
+			// First, claim a pending affinity.
+			pa, err := c.blockReaderWriter.getPendingAffinity(ctx, hostname, *blockCIDR)
+			if err != nil {
+				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+					logCtx.WithError(err).Debug("CAS error getting pending affinity - retry")
+					continue
+				}
 				return claimed, failed, err
 			}
-		} else {
-			claimed = append(claimed, *blockCIDR)
+
+			// Once we have the affinity, claim the block, which will confirm the affinity.
+			_, err = c.blockReaderWriter.claimAffineBlock(ctx, pa, *cfg)
+			if err != nil {
+				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+					logCtx.WithError(err).Debug("CAS error claiming affine block - retry")
+					continue
+				} else if _, ok := err.(errBlockClaimConflict); ok {
+					logCtx.Debugf("Block %s is claimed by another host", blockCIDR.String())
+					failed = append(failed, *blockCIDR)
+				} else {
+					logCtx.Errorf("Failed to claim block: %v", err)
+					return claimed, failed, err
+				}
+			} else {
+				logCtx.Debugf("Claimed CIDR %s", blockCIDR.String())
+				claimed = append(claimed, *blockCIDR)
+			}
+			break
 		}
 	}
 	return claimed, failed, nil

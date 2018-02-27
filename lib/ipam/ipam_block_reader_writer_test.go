@@ -129,7 +129,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 
 	log.SetLevel(log.DebugLevel)
 
-	Context("IPAM block allocation race conditions (mocked client)", func() {
+	Context("IPAM block allocation race conditions", func() {
 
 		var (
 			bc           api.Client
