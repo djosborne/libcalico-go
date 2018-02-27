@@ -53,3 +53,11 @@ func (e errBlockClaimConflict) Error() string {
 	}
 	return fmt.Sprintf("%v already claimed", e.Block.CIDR)
 }
+
+// errStaleAffinity indicates to the calling code that the given affinity
+// is not confirmed, and that the corresponding block belongs to another host.
+type errStaleAffinity string
+
+func (e errStaleAffinity) Error() string {
+	return string(e)
+}

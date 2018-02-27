@@ -111,6 +111,7 @@ func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair)
 	cidr := aff.Key.(model.BlockAffinityKey).CIDR
 	host := aff.Key.(model.BlockAffinityKey).Host
 	state := aff.Value.(*model.BlockAffinity).State
+	logCtx := log.WithFields(log.Fields{"cidr": cidr, "host": host, "state": state})
 
 	// Get the block referenced by this affinity.
 	b, err := c.client.Get(ctx, model.BlockKey{CIDR: cidr}, "")
@@ -120,22 +121,25 @@ func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair)
 			aff.Value.(*model.BlockAffinity).State = model.StatePending
 			aff, err = c.client.Update(ctx, aff)
 			if err != nil {
+				logCtx.WithError(err).Debug("Error updating block affinity")
 				return nil, err
 			}
 
 			cfg, err := c.GetIPAMConfig(ctx)
 			if err != nil {
-				log.Errorf("Error getting IPAM Config: %v", err)
+				logCtx.WithError(err).Errorf("Error getting IPAM Config")
 				return nil, err
 			}
 
 			// Claim the block, which will also confirm the affinity.
 			b, err := c.blockReaderWriter.claimBlockAffinity(ctx, aff, *cfg)
 			if err != nil {
+				logCtx.WithError(err).Debug("Error claiming block affinity")
 				return nil, err
 			}
 			return b, nil
 		}
+		logCtx.WithError(err).Error("Error getting block")
 		return nil, err
 	}
 
@@ -143,12 +147,13 @@ func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair)
 	// We should remove it.
 	blockAffinity := b.Value.(*model.AllocationBlock).Affinity
 	if blockAffinity == nil || *blockAffinity != fmt.Sprintf("host:%s", host) {
-		log.Warn("Block does not match the provided affinity, deleting stale affinity")
+		logCtx.Warn("Block does not match the provided affinity, deleting stale affinity")
 		_, err := c.client.Delete(ctx, aff.Key, aff.Revision)
 		if err != nil {
+			logCtx.WithError(err).Warn("Error deleting stale affinity")
 			return nil, err
 		}
-		return nil, errors.New("Affinity is stale")
+		return nil, errStaleAffinity(fmt.Sprintf("Affinity is stale: %+v", aff))
 	}
 
 	// If the block does match the affinity but the affinity has not been confirmed,
@@ -156,7 +161,9 @@ func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair)
 	if state != model.StateConfirmed {
 		// Write the affinity as pending.
 		aff.Value.(*model.BlockAffinity).State = model.StatePending
+		aff, err = c.client.Update(ctx, aff)
 		if err != nil {
+			logCtx.WithError(err).Debug("Error marking affinity as pending")
 			return nil, err
 		}
 
@@ -164,6 +171,7 @@ func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair)
 		// that might be trying to operate on the block.
 		b, err = c.client.Update(ctx, b)
 		if err != nil {
+			logCtx.WithError(err).Debug("Error writing block")
 			return nil, err
 		}
 
@@ -171,6 +179,7 @@ func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair)
 		aff.Value.(*model.BlockAffinity).State = model.StateConfirmed
 		aff, err = c.client.Update(ctx, aff)
 		if err != nil {
+			logCtx.WithError(err).Debug("Error confirming affinity")
 			return nil, err
 		}
 	}
@@ -191,13 +200,17 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 	logCtx.Debugf("Found %d affine IPv%d blocks for host: %v", len(affBlocks), version.Number, affBlocks)
 	ips := []net.IP{}
 	newIPs := []net.IP{}
+
+	// Make a copy of the blocks for this host which we can modify in the loop.
+	affBlocksC := affBlocks
+
 	for len(ips) < num {
-		if len(affBlocks) == 0 {
+		if len(affBlocksC) == 0 {
 			logCtx.Infof("Ran out of existing affine blocks for host")
 			break
 		}
-		cidr := affBlocks[0]
-		affBlocks = affBlocks[1:]
+		cidr := affBlocksC[0]
+		affBlocksC = affBlocksC[1:]
 
 		// Try to assign from this block - if we hit a CAS error, we'll try this block again.
 		// For any other error, we'll break out and try the next affine block.
@@ -254,46 +267,62 @@ func (c ipamClient) autoAssign(ctx context.Context, num int, handleID *string, a
 			// Claim a new block.
 			logCtx.Infof("Need to allocate %d more addresses - allocate another block", rem)
 			retries = retries - 1
-			pa, err := c.blockReaderWriter.claimNewAffineBlock(ctx, host, version, pools, *config)
+
+			// First, try to find an unclaimed block.
+			subnet, err := c.blockReaderWriter.findUnclaimedBlock(ctx, host, version, pools, *config)
 			if err != nil {
-				// Error claiming new block.
 				if _, ok := err.(noFreeBlocksError); ok {
 					// No free blocks.  Break.
 					logCtx.Info("No free blocks available for allocation")
 					break
-				} else if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-					logCtx.Info("CAS error claiming new block - retry")
-					continue
 				}
-
-				// Some other error claiming an affinity - retry.
-				logCtx.Errorf("Error claiming new block: %v", err)
+				log.WithError(err).Error("Failed to find an unclaimed block")
 				return nil, err
 			}
-			logCtx.Debugf("Claimed pending affinity for %+v", pa.Value)
+			logCtx := logCtx.WithField("subnet", subnet)
 
-			// We have a pending affinity - try to get the block.
-			b, err := c.getBlockFromAffinity(ctx, pa)
-			if err != nil {
-				logCtx.WithError(err).Warning("Failed to get newly claimed block")
-				continue
-			}
-
-			// Claim successful.  Assign addresses from the new block.
-			logCtx.Infof("Claimed new block %v - assigning %d addresses", b, rem)
 			for i := 0; i < ipamEtcdRetries; i++ {
+				// We found an unclaimed block - claim affinity for it.
+				pa, err := c.blockReaderWriter.getPendingAffinity(ctx, host, *subnet)
+				if err != nil {
+					if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+						logCtx.WithError(err).Debug("CAS error claiming pending affinity, retry")
+						continue
+					}
+					logCtx.WithError(err).Errorf("Error claiming pending affinity")
+					return nil, err
+
+				}
+				logCtx.Debugf("Claimed pending affinity for %+v", pa.Value)
+
+				// We have a pending affinity - try to get the block.
+				b, err := c.getBlockFromAffinity(ctx, pa)
+				if err != nil {
+					if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+						logCtx.WithError(err).Debug("CAS error getting block, retry")
+						continue
+					} else if _, ok := err.(errBlockClaimConflict); ok {
+						// Another host took the block from us. Try to find another.
+						logCtx.WithError(err).Debug("Block taken by someone else, find a new one")
+						break
+					} else if _, ok := err.(errStaleAffinity); ok {
+						// Another host took the block from us. Try to find another.
+						logCtx.WithError(err).Debug("Block taken by someone else, find a new one")
+						break
+					}
+					logCtx.WithError(err).Errorf("Error getting block for affinity")
+					return nil, err
+				}
+
+				// Claim successful.  Assign addresses from the new block.
+				logCtx.Infof("Claimed new block %v - assigning %d addresses", b, rem)
 				newIPs, err := c.assignFromExistingBlock(ctx, b, rem, handleID, attrs, host, config.StrictAffinity)
 				if err != nil {
 					if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-						// CAS error allocating from block - retry after refreshing
-						// the block from the data store.
-						b, err = c.client.Get(ctx, b.Key, "")
-						if err != nil {
-							return nil, err
-						}
+						log.WithError(err).Debug("CAS Error assigning from new block - retry")
 						continue
 					}
-					logCtx.Warningf("Failed to assign IPs:", err)
+					logCtx.WithError(err).Warningf("Failed to assign IPs")
 					break
 				}
 				logCtx.Debugf("Assigned IPs from new block: %s", newIPs)

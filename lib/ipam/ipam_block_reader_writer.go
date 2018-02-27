@@ -77,6 +77,23 @@ func (rw blockReaderWriter) getAffineBlocks(ctx context.Context, host string, ve
 // claimNewAffineBlock claims a new pending affinity for a currently unclaimed allocation block. The calling code should use the pending affinity
 // to attempt to claim the actual allocation block.
 func (rw blockReaderWriter) claimNewAffineBlock(ctx context.Context, host string, version ipVersion, requestedPools []cnet.IPNet, config IPAMConfig) (*model.KVPair, error) {
+
+	// First, try to find an unclaimed block.
+	subnet, err := rw.findUnclaimedBlock(ctx, host, version, requestedPools, config)
+	if err != nil {
+		return nil, err
+	}
+
+	// We found an unclaimed block - claim affinity for it and return the pending affinity.
+	pa, err := rw.getPendingAffinity(ctx, host, *subnet)
+	if err != nil {
+		log.WithError(err).Debug("Failed to claim a pending affinity for block")
+		return nil, err
+	}
+	return pa, nil
+}
+
+func (rw blockReaderWriter) findUnclaimedBlock(ctx context.Context, host string, version ipVersion, requestedPools []cnet.IPNet, config IPAMConfig) (*cnet.IPNet, error) {
 	// If requestedPools is not empty, use it.  Otherwise, default to all configured pools.
 	pools := []cnet.IPNet{}
 
@@ -119,7 +136,7 @@ func (rw blockReaderWriter) claimNewAffineBlock(ctx context.Context, host string
 	}
 
 	// Iterate through pools to find a new block.
-	log.Infof("Claiming a new affine block for host '%s'", host)
+	log.Infof("Looking for a new affine block for host '%s'", host)
 	for _, pool := range pools {
 		// Use a block generator to iterate through all of the blocks
 		// that fall within the pool.
@@ -132,13 +149,8 @@ func (rw blockReaderWriter) claimNewAffineBlock(ctx context.Context, host string
 			_, err := rw.client.Get(ctx, key, "")
 			if err != nil {
 				if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
-					// The block does not yet exist in etcd.  Try to grab it.
 					log.Infof("Found free block: %+v", *subnet)
-					pa, err := rw.getPendingAffinity(ctx, host, *subnet)
-					if err != nil {
-						return nil, err
-					}
-					return pa, nil
+					return subnet, nil
 				}
 				log.Errorf("Error getting block: %v", err)
 				return nil, err
