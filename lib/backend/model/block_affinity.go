@@ -33,7 +33,7 @@ var (
 type BlockAffinityState string
 
 const (
-	StateConfirmed       BlockAffinityState = ""
+	StateConfirmed       BlockAffinityState = "confirmed"
 	StatePending         BlockAffinityState = "pending"
 	StatePendingDeletion BlockAffinityState = "pendingDeletion"
 )

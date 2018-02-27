@@ -157,8 +157,8 @@ func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair)
 	}
 
 	// If the block does match the affinity but the affinity has not been confirmed,
-	// try to confirm it.
-	if state != model.StateConfirmed {
+	// try to confirm it. Treat empty string as confirmed for compatibility with older data.
+	if state != model.StateConfirmed || state != "" {
 		// Write the affinity as pending.
 		aff.Value.(*model.BlockAffinity).State = model.StatePending
 		aff, err = c.client.Update(ctx, aff)
@@ -998,9 +998,20 @@ func (c ipamClient) incrementHandle(ctx context.Context, handleID string, blockC
 		// Compare and swap the handle using the KVPair from above.  We've been
 		// manipulating the structure in the KVPair, so pass straight back to
 		// apply the changes.
-		_, err = c.client.Update(ctx, obj)
-		if err != nil {
-			continue
+		if obj.Revision != "" {
+			// This is an existing handle - update it.
+			_, err = c.client.Update(ctx, obj)
+			if err != nil {
+				log.WithError(err).Warning("Failed to update handle, retry")
+				continue
+			}
+		} else {
+			// This is a new handle - create it.
+			_, err = c.client.Create(ctx, obj)
+			if err != nil {
+				log.WithError(err).Warning("Failed to create handle, retry")
+				continue
+			}
 		}
 		return nil
 	}

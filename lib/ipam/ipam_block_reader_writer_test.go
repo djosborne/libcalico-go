@@ -182,7 +182,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 					j := i
 					go func() {
 						testhost := fmt.Sprintf("host-%d", j)
-						ips, err := ic.autoAssign(ctx, 1, nil, nil, nil, ipv4, testhost)
+						ips, err := ic.autoAssign(ctx, 1, &testhost, nil, nil, ipv4, testhost)
 						if err != nil {
 							testErr = err
 						}
@@ -207,15 +207,39 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 				// Each block in the IP pool should have exactly one corresponding affinity.
 				Expect(len(affs.KVPairs)).To(Equal(16))
 
-				// For each affinity, expect the corresponding block to have the same affinity.
+				// Validate the affinities.
 				for _, a := range affs.KVPairs {
 					log.Infof("Validaing affinity: %+v", a)
 					b, err := bc.Get(ctx, model.BlockKey{CIDR: a.Key.(model.BlockAffinityKey).CIDR}, "")
 					Expect(err).NotTo(HaveOccurred())
+
+					// Each affinity should match the block it points to.
 					Expect(*b.Value.(*model.AllocationBlock).Affinity).To(Equal(fmt.Sprintf("host:%s", a.Key.(model.BlockAffinityKey).Host)))
 
 					// Each affinity should be confirmed.
 					Expect(a.Value.(*model.BlockAffinity).State).To(Equal(model.StateConfirmed))
+				}
+			})
+
+			By("checking each allocated IP is within the correct block for that host", func() {
+				// Iterate through all the hosts. If the host has an affine block,
+				// make sure the IPs assigned to that host are within the block.
+				for i := 0; i < 32; i++ {
+					hostname := fmt.Sprintf("host-%d", i)
+					affs, err := bc.List(ctx, model.BlockAffinityListOptions{Host: hostname}, "")
+					Expect(err).NotTo(HaveOccurred())
+					if len(affs.KVPairs) != 0 {
+						// This host has an affine block. Check the IP allocation is from it.
+						// Get the IPs assigned to this host.
+						ips, err := ic.IPsByHandle(ctx, hostname)
+						Expect(err).NotTo(HaveOccurred())
+						Expect(len(ips)).To(Equal(1))
+
+						// Expect that the IP address is within the affine block.
+						cidr := affs.KVPairs[0].Key.(model.BlockAffinityKey).CIDR
+						ip := ips[0]
+						Expect(cidr.Contains(ip.IP)).To(BeTrue())
+					}
 				}
 			})
 		})
@@ -441,7 +465,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 			}
 			affKVP2 := &model.KVPair{
 				Key:   model.BlockAffinityKey{Host: hostB, CIDR: *net},
-				Value: model.BlockAffinity{},
+				Value: model.BlockAffinity{State: model.StateConfirmed},
 			}
 
 			fc.createFuncs[fmt.Sprintf("%s", affKVP.Key)] = func(ctx context.Context, object *model.KVPair) (*model.KVPair, error) {
@@ -585,7 +609,6 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 	})
 
 	Context("test claiming / releasing affinities", func() {
-
 		var (
 			rw   blockReaderWriter
 			p    *ipPoolAccessor
