@@ -125,7 +125,7 @@ func (c *fakeClient) Watch(ctx context.Context, list model.ListInterface, revisi
 	return nil, nil
 }
 
-var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.DatastoreEtcdV3, func(config apiconfig.CalicoAPIConfig) {
+var _ = testutils.E2eDatastoreDescribe("IPAM affine block allocation tests", testutils.DatastoreEtcdV3, func(config apiconfig.CalicoAPIConfig) {
 
 	log.SetLevel(log.DebugLevel)
 
@@ -299,6 +299,94 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 					// Each affinity should be confirmed.
 					Expect(a.Value.(*model.BlockAffinity).State).To(Equal(model.StateConfirmed))
 				}
+			})
+		})
+
+		It("should handle multiple racing claims for the same affinity", func() {
+			By("setting up the client for the test", func() {
+				// Pool has room for 16 blocks.
+				pls := &ipPoolAccessor{pools: map[string]bool{"10.0.0.0/22": true}}
+				rw = blockReaderWriter{client: bc, pools: pls}
+				ic = &ipamClient{
+					client:            bc,
+					pools:             pls,
+					blockReaderWriter: rw,
+				}
+
+				var err error
+				_, net, err = cnet.ParseCIDR("10.0.0.0/22")
+				Expect(err).NotTo(HaveOccurred())
+			})
+
+			By("racing to claim the same cidr on the same host", func() {
+				wg := sync.WaitGroup{}
+				var testErr error
+
+				for i := 0; i < 4; i++ {
+					wg.Add(1)
+					go func() {
+						testhost := "same-host"
+						success, failed, err := ic.ClaimAffinity(ctx, *net, testhost)
+						if err != nil {
+							testErr = err
+						}
+						if len(failed) != 0 {
+							testErr = fmt.Errorf("failed to claim affinity %v | %v", success, failed)
+						}
+						if len(success) != 16 {
+							testErr = fmt.Errorf("didn't claim all 16: %v | %v", success, failed)
+						}
+
+						wg.Done()
+					}()
+				}
+
+				// Wait for allocations to finish, then assert success.
+				wg.Wait()
+				Expect(testErr).NotTo(HaveOccurred())
+			})
+
+			By("correctly allocating affinities", func() {
+				affs, err := bc.List(ctx, model.BlockAffinityListOptions{}, "")
+				Expect(err).NotTo(HaveOccurred())
+
+				// Each block in the IP pool should have exactly one corresponding affinity.
+				Expect(len(affs.KVPairs)).To(Equal(16))
+
+				// Validate the affinities.
+				for _, a := range affs.KVPairs {
+					log.Infof("Validaing affinity: %+v", a)
+					b, err := bc.Get(ctx, model.BlockKey{CIDR: a.Key.(model.BlockAffinityKey).CIDR}, "")
+					Expect(err).NotTo(HaveOccurred())
+
+					// Each affinity should match the block it points to.
+					Expect(*b.Value.(*model.AllocationBlock).Affinity).To(Equal(fmt.Sprintf("host:%s", a.Key.(model.BlockAffinityKey).Host)))
+
+					// Each affinity should be confirmed.
+					Expect(a.Value.(*model.BlockAffinity).State).To(Equal(model.StateConfirmed))
+				}
+			})
+
+			By("racing to release the affinities", func() {
+				wg := sync.WaitGroup{}
+				var testErr error
+
+				for i := 0; i < 4; i++ {
+					wg.Add(1)
+					go func() {
+						testhost := "same-host"
+						err := ic.ReleaseAffinity(ctx, *net, testhost)
+						if err != nil {
+							testErr = err
+						}
+
+						wg.Done()
+					}()
+				}
+
+				// Wait for allocations to finish, then assert success.
+				wg.Wait()
+				Expect(testErr).NotTo(HaveOccurred())
 			})
 		})
 

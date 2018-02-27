@@ -276,94 +276,78 @@ func (rw blockReaderWriter) releaseBlockAffinity(ctx context.Context, host strin
 		return errors.New("Hostname must be sepcified to release block affinity")
 	}
 
-	for i := 0; i < ipamEtcdRetries; i++ {
-		// Read the model.KVPair containing the block affinity.
-		logCtx := log.WithFields(log.Fields{"block": blockCIDR.String(), "retry": i})
-		logCtx.Debugf("Attempt to release affinity for block")
-		aff, err := rw.client.Get(ctx, model.BlockAffinityKey{Host: host, CIDR: blockCIDR}, "")
-		if err != nil {
-			logCtx.WithError(err).Errorf("Error getting block affinity %s", blockCIDR.String())
-			return err
-		}
-
-		// Mark it as pending deletion.
-		aff.Value.(*model.BlockAffinity).State = model.StatePendingDeletion
-		aff, err = rw.client.Update(ctx, aff)
-		if err != nil {
-			if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-				// CASError - continue.
-				continue
-			}
-
-			logCtx.WithError(err).Errorf("Failed to mark block affinity %s as pending deletion", blockCIDR.String())
-			return err
-		}
-
-		// Read the model.KVPair containing the block
-		// and pull out the allocationBlock object.  We need to hold on to this
-		// so that we can pass it back to the datastore on Update.
-		obj, err := rw.client.Get(ctx, model.BlockKey{CIDR: blockCIDR}, "")
-		if err != nil {
-			logCtx.Errorf("Error getting block %s: %v", blockCIDR.String(), err)
-			return err
-		}
-		b := allocationBlock{obj.Value.(*model.AllocationBlock)}
-
-		// Check that the block affinity matches the given affinity.
-		if b.Affinity != nil && !hostAffinityMatches(host, b.AllocationBlock) {
-			logCtx.Errorf("Mismatched affinity: %s != %s", *b.Affinity, "host:"+host)
-			return errBlockClaimConflict{Block: b}
-		}
-
-		if b.empty() {
-			// If the block is empty, we can delete it.
-			logCtx.Debug("Block is empty - delete it")
-			_, err := rw.client.Delete(ctx, model.BlockKey{CIDR: b.CIDR}, obj.Revision)
-			if err != nil {
-				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-					logCtx.WithError(err).Debug("CAS error deleting block, retry")
-					continue
-				} else if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
-					logCtx.WithError(err).Error("Error deleting block")
-					return err
-				}
-				logCtx.Debug("Block has already been deleted, carry on")
-			}
-		} else {
-			// Otherwise, we need to remove affinity from it.
-			// This prevents the host from automatically assigning
-			// from this block unless we're allowed to overflow into
-			// non-affine blocks.
-			logCtx.Debug("Block is not empty - remove the affinity")
-			b.Affinity = nil
-
-			// Pass back the original KVPair with the new
-			// block information so we can do a CAS.
-			obj.Value = b.AllocationBlock
-			_, err = rw.client.Update(ctx, obj)
-			if err != nil {
-				if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
-					logCtx.WithError(err).Debug("CAS error removing affinity from block, retry")
-					continue
-				}
-				logCtx.WithError(err).Error("Failed to remove affinity from block")
-				return err
-			}
-		}
-
-		// We've removed / updated the block, so perform a compare-and-delete on the BlockAffinity.
-		_, err = rw.client.Delete(ctx, model.BlockAffinityKey{Host: host, CIDR: b.CIDR}, aff.Revision)
-		if err != nil {
-			// Return the error unless the affinity didn't exist.
-			if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
-				logCtx.Errorf("Error deleting block affinity: %v", err)
-				return err
-			}
-		}
-		return nil
-
+	// Read the model.KVPair containing the block affinity.
+	logCtx := log.WithFields(log.Fields{"block": blockCIDR.String()})
+	logCtx.Debugf("Attempt to release affinity for block")
+	aff, err := rw.client.Get(ctx, model.BlockAffinityKey{Host: host, CIDR: blockCIDR}, "")
+	if err != nil {
+		logCtx.WithError(err).Errorf("Error getting block affinity %s", blockCIDR.String())
+		return err
 	}
-	return errors.New("Max retries hit")
+
+	// Mark it as pending deletion.
+	aff.Value.(*model.BlockAffinity).State = model.StatePendingDeletion
+	aff, err = rw.client.Update(ctx, aff)
+	if err != nil {
+		logCtx.WithError(err).Warnf("Failed to mark block affinity as pending deletion")
+		return err
+	}
+
+	// Read the model.KVPair containing the block
+	// and pull out the allocationBlock object.  We need to hold on to this
+	// so that we can pass it back to the datastore on Update.
+	obj, err := rw.client.Get(ctx, model.BlockKey{CIDR: blockCIDR}, "")
+	if err != nil {
+		logCtx.WithError(err).Warnf("Error getting block")
+		return err
+	}
+	b := allocationBlock{obj.Value.(*model.AllocationBlock)}
+
+	// Check that the block affinity matches the given affinity.
+	if b.Affinity != nil && !hostAffinityMatches(host, b.AllocationBlock) {
+		logCtx.Errorf("Mismatched affinity: %s != %s", *b.Affinity, "host:"+host)
+		return errBlockClaimConflict{Block: b}
+	}
+
+	if b.empty() {
+		// If the block is empty, we can delete it.
+		logCtx.Debug("Block is empty - delete it")
+		_, err := rw.client.Delete(ctx, model.BlockKey{CIDR: b.CIDR}, obj.Revision)
+		if err != nil {
+			if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
+				logCtx.WithError(err).Error("Error deleting block")
+				return err
+			}
+			logCtx.Debug("Block has already been deleted, carry on")
+		}
+	} else {
+		// Otherwise, we need to remove affinity from it.
+		// This prevents the host from automatically assigning
+		// from this block unless we're allowed to overflow into
+		// non-affine blocks.
+		logCtx.Debug("Block is not empty - remove the affinity")
+		b.Affinity = nil
+
+		// Pass back the original KVPair with the new
+		// block information so we can do a CAS.
+		obj.Value = b.AllocationBlock
+		_, err = rw.client.Update(ctx, obj)
+		if err != nil {
+			logCtx.WithError(err).Error("Failed to remove affinity from block")
+			return err
+		}
+	}
+
+	// We've removed / updated the block, so perform a compare-and-delete on the BlockAffinity.
+	_, err = rw.client.Delete(ctx, model.BlockAffinityKey{Host: host, CIDR: b.CIDR}, aff.Revision)
+	if err != nil {
+		// Return the error unless the affinity didn't exist.
+		if _, ok := err.(cerrors.ErrorResourceDoesNotExist); !ok {
+			logCtx.Errorf("Error deleting block affinity: %v", err)
+			return err
+		}
+	}
+	return nil
 }
 
 // withinConfiguredPools returns true if the given IP is within a configured

@@ -730,16 +730,22 @@ func (c ipamClient) ReleaseAffinity(ctx context.Context, cidr net.IPNet, host st
 	// Release all blocks within the given cidr.
 	blocks := blockGenerator(cidr)
 	for blockCIDR := blocks(); blockCIDR != nil; blockCIDR = blocks() {
-		err := c.blockReaderWriter.releaseBlockAffinity(ctx, hostname, *blockCIDR)
-		if err != nil {
-			if _, ok := err.(errBlockClaimConflict); ok {
-				// Not claimed by this host - ignore.
-			} else if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
-				// Block does not exist - ignore.
-			} else {
-				log.Errorf("Error releasing affinity for '%s': %v", *blockCIDR, err)
-				return err
+		for i := 0; i < ipamEtcdRetries; i++ {
+			err := c.blockReaderWriter.releaseBlockAffinity(ctx, hostname, *blockCIDR)
+			if err != nil {
+				if _, ok := err.(errBlockClaimConflict); ok {
+					// Not claimed by this host - ignore.
+				} else if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
+					// Block does not exist - ignore.
+				} else if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+					log.WithError(err).Debug("CAS error releasing block affinity - retry")
+					continue
+				} else {
+					log.Errorf("Error releasing affinity for '%s': %v", *blockCIDR, err)
+					return err
+				}
 			}
+			break
 		}
 	}
 	return nil
@@ -793,19 +799,24 @@ func (c ipamClient) ReleasePoolAffinities(ctx context.Context, pool net.IPNet) e
 
 		for blockString, host := range pairs {
 			_, blockCIDR, _ := net.ParseCIDR(blockString)
-			err = c.blockReaderWriter.releaseBlockAffinity(ctx, host, *blockCIDR)
-			if err != nil {
-				if _, ok := err.(errBlockClaimConflict); ok {
-					retry = true
-				} else if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
-					log.Debugf("No such block '%s'", blockCIDR.String())
-					continue
-				} else {
-					log.Errorf("Error releasing affinity for '%s': %v", blockCIDR.String(), err)
-					return err
+			for i := 0; i < ipamEtcdRetries; i++ {
+				err = c.blockReaderWriter.releaseBlockAffinity(ctx, host, *blockCIDR)
+				if err != nil {
+					if _, ok := err.(errBlockClaimConflict); ok {
+						retry = true
+					} else if _, ok := err.(cerrors.ErrorResourceDoesNotExist); ok {
+						log.Debugf("No such block '%s'", blockCIDR.String())
+						break
+					} else if _, ok := err.(cerrors.ErrorResourceUpdateConflict); ok {
+						log.WithError(err).Debug("CAS error releasing block affinity - retry")
+						continue
+					} else {
+						log.Errorf("Error releasing affinity for '%s': %v", blockCIDR.String(), err)
+						return err
+					}
 				}
+				break
 			}
-
 		}
 
 		if !retry {
