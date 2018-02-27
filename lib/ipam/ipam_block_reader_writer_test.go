@@ -333,7 +333,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 				Expect(err).NotTo(HaveOccurred())
 
 				config := IPAMConfig{}
-				_, err = rw.claimBlockAffinity(ctx, pa, config)
+				_, err = rw.claimAffineBlock(ctx, pa, config)
 				Expect(err).NotTo(BeNil())
 
 				// Should hit a resource update conflict.
@@ -627,7 +627,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 				Expect(err).NotTo(HaveOccurred())
 
 				config := IPAMConfig{}
-				_, err = rw.claimBlockAffinity(ctx, pa, config)
+				_, err = rw.claimAffineBlock(ctx, pa, config)
 				Expect(err).NotTo(HaveOccurred())
 			})
 
@@ -636,7 +636,7 @@ var _ = testutils.E2eDatastoreDescribe("IPAM block allocation tests", testutils.
 				Expect(err).NotTo(HaveOccurred())
 
 				config := IPAMConfig{}
-				_, err = rw.claimBlockAffinity(ctx, pa, config)
+				_, err = rw.claimAffineBlock(ctx, pa, config)
 				Expect(err).NotTo(HaveOccurred())
 			})
 

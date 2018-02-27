@@ -132,7 +132,7 @@ func (c ipamClient) getBlockFromAffinity(ctx context.Context, aff *model.KVPair)
 			}
 
 			// Claim the block, which will also confirm the affinity.
-			b, err := c.blockReaderWriter.claimBlockAffinity(ctx, aff, *cfg)
+			b, err := c.blockReaderWriter.claimAffineBlock(ctx, aff, *cfg)
 			if err != nil {
 				logCtx.WithError(err).Debug("Error claiming block affinity")
 				return nil, err
@@ -449,7 +449,7 @@ func (c ipamClient) AssignIP(ctx context.Context, args AssignIPArgs) error {
 					}
 					return err
 				}
-				_, err = c.blockReaderWriter.claimBlockAffinity(ctx, pa, *cfg)
+				_, err = c.blockReaderWriter.claimAffineBlock(ctx, pa, *cfg)
 				if err != nil {
 					if _, ok := err.(*errBlockClaimConflict); ok {
 						log.Warningf("Someone else claimed block %s before us", blockCIDR.String())
@@ -676,7 +676,7 @@ func (c ipamClient) ClaimAffinity(ctx context.Context, cidr net.IPNet, host stri
 		}
 
 		// Once we have the affinity, claim the block, which will confirm the affinity.
-		_, err = c.blockReaderWriter.claimBlockAffinity(ctx, pa, *cfg)
+		_, err = c.blockReaderWriter.claimAffineBlock(ctx, pa, *cfg)
 		if err != nil {
 			if _, ok := err.(errBlockClaimConflict); ok {
 				// Claimed by someone else - add to failed list.
